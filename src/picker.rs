@@ -164,7 +164,7 @@ fn state_color(state: AgentState) -> Color {
     }
 }
 
-struct SearchDocument(String);
+struct SearchDocument(Vec<String>);
 
 impl SearchDocument {
     fn for_row(row: &Row) -> Self {
@@ -183,7 +183,7 @@ impl SearchDocument {
             }
         }
 
-        SearchDocument(fields.join(" "))
+        SearchDocument(fields)
     }
 }
 
@@ -209,10 +209,18 @@ fn filter(rows: &[Row], query: &str, matcher: &mut Matcher) -> Vec<usize> {
 
     for (index, row) in rows.iter().enumerate() {
         let document = SearchDocument::for_row(row);
-        let haystack = Utf32Str::new(&document.0, &mut buffer);
-        let Some(score) = pattern.score(haystack, matcher) else {
-            continue;
-        };
+        // Match each field independently and keep its strongest score. Joining
+        // fields lets a fuzzy subsequence cross metadata boundaries, creating
+        // results that do not actually match any name, path, or pane label.
+        let score = document
+            .0
+            .iter()
+            .filter_map(|field| {
+                let haystack = Utf32Str::new(field, &mut buffer);
+                pattern.score(haystack, matcher)
+            })
+            .max();
+        let Some(score) = score else { continue };
         if matches!(row.kind, Kind::Open { .. }) {
             open.push((score, index));
         } else {
@@ -770,6 +778,26 @@ mod tests {
         assert_eq!(filter(&rows, "backend", &mut matcher), vec![0]);
         assert_eq!(filter(&rows, "claude", &mut matcher), vec![0]);
         assert_eq!(filter(&rows, "working", &mut matcher), vec![0]);
+    }
+
+    #[test]
+    fn fuzzy_matches_do_not_cross_metadata_fields() {
+        let rows = vec![
+            open(
+                "instructional-design-agent",
+                "~/Projects/00-in-progress/instructional-design-agent",
+                "/Users/me/Projects/00-in-progress/instructional-design-agent",
+                &[],
+            ),
+            project(
+                "deadpotatodotcom",
+                "~/Projects/00-in-progress/deadpotatodotcom",
+                "/Users/me/Projects/00-in-progress/deadpotatodotcom",
+            ),
+        ];
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+
+        assert_eq!(filter(&rows, "deadpo", &mut matcher), vec![1]);
     }
 
     #[test]
