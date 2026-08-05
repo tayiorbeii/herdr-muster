@@ -121,10 +121,13 @@ pub fn spawn(client: CliHerdr, config_path: PathBuf, bound: HashMap<PathBuf, Str
             return;
         }
 
-        let projects = sources::gather(
+        let Some(projects) = sources::gather(
             &config,
             &zoxide_lines(config.use_zoxide, &worker_cancellation),
-        );
+            &worker_cancellation,
+        ) else {
+            return;
+        };
         if worker_cancellation.load(Ordering::Relaxed) {
             return;
         }

@@ -138,7 +138,16 @@ struct CrWs {
 
 fn clean(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
-        let trimmed = value.trim();
+        // Herdr titles originate in terminal-controlled state. Remove every
+        // terminal control range before trimming so pane text cannot inject
+        // escape sequences into the picker.
+        let sanitized: String = value
+            .chars()
+            .filter(|character| {
+                !matches!(character, '\u{0000}'..='\u{001f}' | '\u{007f}' | '\u{0080}'..='\u{009f}')
+            })
+            .collect();
+        let trimmed = sanitized.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     })
 }
@@ -208,6 +217,7 @@ pub fn parse_panes(json: &str) -> Result<Vec<Pane>> {
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_POLL: Duration = Duration::from_millis(20);
 const PROCESS_GROUP_GRACE: Duration = Duration::from_millis(50);
+const READER_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Stop a command and every descendant that inherited its process group. This
 /// also closes pipes held by backgrounded descendants so output readers finish.
@@ -259,15 +269,17 @@ pub(crate) fn command_output(
         .map_err(|error| HerdrError::Spawn(format!("spawn {label}: {error}")))?;
     let stdout = child.stdout.take().expect("stdout configured as piped");
     let stderr = child.stderr.take().expect("stderr configured as piped");
+    let (stdout_sender, stdout_receiver) = std::sync::mpsc::sync_channel(1);
     let stdout_reader = thread::spawn(move || {
         let mut bytes = Vec::new();
         let mut stdout = stdout;
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
+        let _ = stdout_sender.send(stdout.read_to_end(&mut bytes).map(|_| bytes));
     });
+    let (stderr_sender, stderr_receiver) = std::sync::mpsc::sync_channel(1);
     let stderr_reader = thread::spawn(move || {
         let mut bytes = Vec::new();
         let mut stderr = stderr;
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
+        let _ = stderr_sender.send(stderr.read_to_end(&mut bytes).map(|_| bytes));
     });
     let started = Instant::now();
 
@@ -299,16 +311,39 @@ pub(crate) fn command_output(
         }
     };
 
-    // Always drain and join after terminating the group: callers must not
-    // return while output-reader threads can outlive a cancelled refresh.
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| HerdrError::Spawn(format!("read {label} stdout: reader panicked")))?
-        .map_err(|error| HerdrError::Spawn(format!("read {label} stdout: {error}")))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| HerdrError::Spawn(format!("read {label} stderr: reader panicked")))?
-        .map_err(|error| HerdrError::Spawn(format!("read {label} stderr: {error}")))?;
+    // A descendant can escape the process group with setsid() while retaining
+    // these pipe ends. Do not let that make cancellation or timeout teardown
+    // wait forever: readers get one shared bounded grace period, after which
+    // dropping their JoinHandles deliberately detaches them.
+    let reader_deadline = Instant::now() + READER_COMPLETION_TIMEOUT;
+    let receive_reader = |receiver: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>, stream| {
+        let remaining = reader_deadline.saturating_duration_since(Instant::now());
+        receiver
+            .recv_timeout(remaining)
+            .map_err(|error| match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => HerdrError::Spawn(format!(
+                    "read {label} {stream}: reader did not finish after process teardown"
+                )),
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    HerdrError::Spawn(format!("read {label} {stream}: reader disconnected"))
+                }
+            })?
+            .map_err(|error| HerdrError::Spawn(format!("read {label} {stream}: {error}")))
+    };
+    let stdout = receive_reader(stdout_receiver, "stdout");
+    let stderr = receive_reader(stderr_receiver, "stderr");
+
+    // Join only readers that have reported completion. Dropping a JoinHandle
+    // detaches a blocked reader, whose pipe will close when an escaped holder
+    // eventually exits.
+    if stdout.is_ok() {
+        let _ = stdout_reader.join();
+    }
+    if stderr.is_ok() {
+        let _ = stderr_reader.join();
+    }
+    let stdout = stdout?;
+    let stderr = stderr?;
     let status = status?;
     Ok(Output {
         status,
@@ -430,6 +465,22 @@ mod tests {
     }
 
     #[test]
+    fn removes_terminal_control_characters_from_pane_names() {
+        let json = r#"{"result":{"panes":[
+            {"pane_id":"w1:p1","workspace_id":"w1","label":" \u001b[2J dashboard\u0007 "},
+            {"pane_id":"w1:p2","workspace_id":"w1","terminal_title_stripped":" \u001b]0;build\u0007 "},
+            {"pane_id":"w1:p3","workspace_id":"w1","label":"\u009b2J\u007fclean"}
+        ]}}"#;
+        let panes = parse_panes(json).unwrap();
+
+        // ESC/BEL and C1 are removed, leaving their formerly-controlled text
+        // printable and harmless; the prior whitespace trimming is retained.
+        assert_eq!(panes[0].label.as_deref(), Some("[2J dashboard"));
+        assert_eq!(panes[1].terminal_title.as_deref(), Some("]0;build"));
+        assert_eq!(panes[2].label.as_deref(), Some("2Jclean"));
+    }
+
+    #[test]
     fn decodes_herdr_public_pane_numbers() {
         let pane = |suffix: &str| Pane {
             pane_id: format!("w1:p{suffix}"),
@@ -466,6 +517,71 @@ mod tests {
 
         assert!(matches!(error, HerdrError::Cancelled(_)));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_returns_when_setsid_descendant_holds_output_pipes() {
+        struct EscapedProcess(Option<i32>);
+
+        impl Drop for EscapedProcess {
+            fn drop(&mut self) {
+                let Some(pid) = self.0 else { return };
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+                // The process is no longer our child after its parent is
+                // killed, so poll briefly for init to reap it.
+                for _ in 0..20 {
+                    if unsafe { libc::kill(pid, 0) } == -1
+                        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                    {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("escaped.pid");
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = cancellation.clone();
+        let worker = thread::spawn({
+            let pid_file = pid_file.clone();
+            move || {
+                let mut command = Command::new("python3");
+                command.args([
+                    "-c",
+                    "import os, sys, time\npid = os.fork()\nif pid:\n    os.waitpid(pid, 0)\nelse:\n    os.setsid()\n    tmp = sys.argv[1] + '.tmp'\n    open(tmp, 'w').write(str(os.getpid()))\n    os.rename(tmp, sys.argv[1])\n    time.sleep(5)",
+                    pid_file.to_str().unwrap(),
+                ]);
+                command_output(
+                    &mut command,
+                    "escaped pipe holder",
+                    Some(&worker_cancellation),
+                )
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !pid_file.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let escaped = EscapedProcess(Some(
+            std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap(),
+        ));
+        cancellation.store(true, Ordering::Relaxed);
+        let started = Instant::now();
+        let error = worker.join().unwrap().unwrap_err();
+
+        assert!(
+            matches!(error, HerdrError::Spawn(message) if message.contains("reader did not finish"))
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+        drop(escaped);
     }
 
     #[cfg(unix)]

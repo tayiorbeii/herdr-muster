@@ -1,6 +1,7 @@
 use crate::config::{expand_tilde, Config};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -26,68 +27,150 @@ pub fn collapse_home(p: &Path) -> String {
     p.display().to_string()
 }
 
-pub fn git_repos_under(root: &Path) -> Vec<PathBuf> {
+fn cancelled(cancellation: &AtomicBool) -> bool {
+    cancellation.load(Ordering::Relaxed)
+}
+
+fn git_repos_under_with_checkpoint<F>(
+    root: &Path,
+    cancellation: &AtomicBool,
+    checkpoint: &mut F,
+) -> Option<Vec<PathBuf>>
+where
+    F: FnMut(),
+{
+    if cancelled(cancellation) {
+        return None;
+    }
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else { return out };
-    for entry in entries.flatten() {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Some(out);
+    };
+    for entry in entries {
+        checkpoint();
+        if cancelled(cancellation) {
+            return None;
+        }
+        let Ok(entry) = entry else { continue };
         let p = entry.path();
-        if is_project_root(&p) {
+        if is_project_root_with_cancellation(&p, cancellation)? {
             out.push(p);
         }
     }
-    out
+    Some(out)
 }
 
 /// A real git repo root worth suggesting: an existing dir whose basename is not
 /// hidden and whose `.git` is a directory. Excludes hidden dirs (`.claude`,
 /// `.git`), and linked worktrees / submodules (their `.git` is a *file*).
-pub fn is_project_root(p: &Path) -> bool {
-    if !p.is_dir() || basename(p).starts_with('.') {
-        return false;
+fn is_project_root_with_cancellation(p: &Path, cancellation: &AtomicBool) -> Option<bool> {
+    if cancelled(cancellation) {
+        return None;
     }
-    p.join(".git").is_dir()
+    if !p.is_dir() || basename(p).starts_with('.') {
+        return Some(false);
+    }
+    if cancelled(cancellation) {
+        return None;
+    }
+    Some(p.join(".git").is_dir())
 }
 
-fn finalize(raw: Vec<PathBuf>) -> Vec<Candidate> {
+#[allow(dead_code)]
+pub fn is_project_root(p: &Path) -> bool {
+    let cancellation = AtomicBool::new(false);
+    is_project_root_with_cancellation(p, &cancellation).unwrap_or(false)
+}
+
+fn finalize(raw: Vec<PathBuf>, cancellation: &AtomicBool) -> Option<Vec<Candidate>> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for p in raw {
-        let Ok(canon) = std::fs::canonicalize(&p) else { continue };
+        if cancelled(cancellation) {
+            return None;
+        }
+        let Ok(canon) = std::fs::canonicalize(&p) else {
+            continue;
+        };
+        if cancelled(cancellation) {
+            return None;
+        }
         if !canon.is_dir() {
             continue;
         }
         if seen.insert(canon.clone()) {
-            out.push(Candidate { display: collapse_home(&canon), path: canon });
+            out.push(Candidate {
+                display: collapse_home(&canon),
+                path: canon,
+            });
         }
     }
-    out
+    Some(out)
 }
 
-pub fn gather(cfg: &Config, zoxide_lines: &[String]) -> Vec<Candidate> {
+fn gather_with_checkpoint<F>(
+    cfg: &Config,
+    zoxide_lines: &[String],
+    cancellation: &AtomicBool,
+    checkpoint: &mut F,
+) -> Option<Vec<Candidate>>
+where
+    F: FnMut(),
+{
     let mut raw: Vec<PathBuf> = Vec::new();
     // Explicit paths bypass the repo-root filter — user opted in by naming them.
     for p in &cfg.paths {
+        checkpoint();
+        if cancelled(cancellation) {
+            return None;
+        }
         raw.push(expand_tilde(p));
     }
     // roots + zoxide are noisy: keep only git repo roots.
     for r in &cfg.roots {
-        raw.extend(git_repos_under(&expand_tilde(r)));
+        checkpoint();
+        if cancelled(cancellation) {
+            return None;
+        }
+        raw.extend(git_repos_under_with_checkpoint(
+            &expand_tilde(r),
+            cancellation,
+            checkpoint,
+        )?);
     }
     if cfg.use_zoxide {
         for l in zoxide_lines {
+            checkpoint();
+            if cancelled(cancellation) {
+                return None;
+            }
             let p = PathBuf::from(l);
-            if is_project_root(&p) {
+            if is_project_root_with_cancellation(&p, cancellation)? {
                 raw.push(p);
             }
         }
     }
-    finalize(raw)
+    finalize(raw, cancellation)
+}
+
+/// Returns `None` when cancellation interrupts discovery, so callers do not
+/// mistake a partial traversal for a complete project snapshot.
+pub fn gather(
+    cfg: &Config,
+    zoxide_lines: &[String],
+    cancellation: &AtomicBool,
+) -> Option<Vec<Candidate>> {
+    gather_with_checkpoint(cfg, zoxide_lines, cancellation, &mut || {})
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn git_repos_under_finds_only_repos() {
@@ -95,7 +178,11 @@ mod tests {
         let repo = tmp.path().join("proj");
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::create_dir_all(tmp.path().join("plain")).unwrap();
-        assert_eq!(git_repos_under(tmp.path()), vec![repo]);
+        let cancellation = AtomicBool::new(false);
+        assert_eq!(
+            git_repos_under_with_checkpoint(tmp.path(), &cancellation, &mut || {}),
+            Some(vec![repo])
+        );
     }
 
     #[test]
@@ -104,7 +191,10 @@ mod tests {
         let a = tmp.path().join("a");
         fs::create_dir_all(&a).unwrap();
         let cfg = Config {
-            paths: vec![a.to_string_lossy().to_string(), a.to_string_lossy().to_string()],
+            paths: vec![
+                a.to_string_lossy().to_string(),
+                a.to_string_lossy().to_string(),
+            ],
             roots: vec![],
             use_zoxide: true,
         };
@@ -112,9 +202,53 @@ mod tests {
             a.to_string_lossy().to_string(),
             tmp.path().join("ghost").to_string_lossy().to_string(),
         ];
-        let got = gather(&cfg, &z);
+        let cancellation = AtomicBool::new(false);
+        let got = gather(&cfg, &z, &cancellation).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].path, fs::canonicalize(&a).unwrap());
+    }
+
+    #[test]
+    fn gather_stops_promptly_when_cancelled_mid_root_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        fs::create_dir_all(root.join("repo/.git")).unwrap();
+        fs::create_dir_all(root.join("plain")).unwrap();
+        let cfg = Config {
+            paths: vec![],
+            roots: vec![root.to_string_lossy().to_string()],
+            use_zoxide: false,
+        };
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = cancellation.clone();
+        let (at_entry, entry_reached) = mpsc::sync_channel(1);
+        let (resume, resume_worker) = mpsc::sync_channel(1);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+
+        let worker = thread::spawn(move || {
+            let mut checkpoints = 0;
+            let result = gather_with_checkpoint(&cfg, &[], &worker_cancellation, &mut || {
+                checkpoints += 1;
+                // The first checkpoint is before the root traversal; the
+                // second is after read_dir yielded its first filesystem entry.
+                if checkpoints == 2 {
+                    at_entry.send(()).unwrap();
+                    resume_worker.recv().unwrap();
+                }
+            });
+            result_sender.send(result).unwrap();
+        });
+
+        entry_reached.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancellation.store(true, Ordering::Relaxed);
+        resume.send(()).unwrap();
+        assert_eq!(
+            result_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            None
+        );
+        worker.join().unwrap();
     }
 
     #[test]

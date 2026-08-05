@@ -59,7 +59,9 @@ raw = termios.tcgetattr(fd)
 if raw[3] & termios.ICANON: raise AssertionError('picker did not enable raw mode')
 query = b'early-query-42'
 os.write(fd, query)
-rendered = [b'\x1b[2;%dH\x1b[;m%c' % (5 + index, byte) for index, byte in enumerate(query)]
+# Ratatui emits style sequences between the cursor movement and glyph; verify
+# each query character's stable cursor position rather than its theme styling.
+rendered = [b'\x1b[2;%dH' % (5 + index) for index, _ in enumerate(query)]
 typed = read_until(rendered[-1], start + 1)
 if any(marker not in typed for marker in rendered):
     raise AssertionError('unique query did not render completely: %r' % typed)

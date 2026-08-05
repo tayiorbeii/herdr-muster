@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -40,23 +40,12 @@ impl Registry {
             .unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
 
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("state.json");
-        let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
         let text = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-
-        let result = (|| -> io::Result<()> {
-            let mut file = File::create(&temporary)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()?;
-            fs::rename(&temporary, path)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        temporary.write_all(text.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -120,6 +109,9 @@ mod tests {
     fn save_load_roundtrip_is_atomic() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("sub").join("state.json");
+        fs::create_dir(path.parent().unwrap()).unwrap();
+        fs::write(&path, r#"{"map":{"/old":"w0"}}"#).unwrap();
+
         let mut registry = Registry::default();
         registry.bind(Path::new("/a"), "w1");
         registry.save(&path).unwrap();
@@ -129,6 +121,7 @@ mod tests {
             loaded.workspace_for(Path::new("/a")).map(String::as_str),
             Some("w1")
         );
+        assert!(loaded.workspace_for(Path::new("/old")).is_none());
         assert!(fs::read_dir(path.parent().unwrap())
             .unwrap()
             .all(|entry| !entry
@@ -136,6 +129,28 @@ mod tests {
                 .file_name()
                 .to_string_lossy()
                 .ends_with(".tmp")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_does_not_follow_former_predictable_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let target = directory.path().join("target");
+        fs::write(&target, "do not overwrite").unwrap();
+        let former_temporary = directory
+            .path()
+            .join(format!(".state.json.{}.tmp", std::process::id()));
+        symlink(&target, &former_temporary).unwrap();
+
+        let mut registry = Registry::default();
+        registry.bind(Path::new("/a"), "w1");
+        registry.save(&path).unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "do not overwrite");
+        assert_eq!(fs::read_link(&former_temporary).unwrap(), target);
     }
 
     #[cfg(unix)]
