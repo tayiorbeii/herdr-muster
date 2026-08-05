@@ -1,166 +1,458 @@
 use crate::model::{AgentState, Kind, Row};
+use crate::refresh::{Message as RefreshMessage, Snapshot, Updates};
+use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph};
-use std::io::stdout;
+use std::collections::HashSet;
+use std::io::{self, stdout};
+use std::sync::mpsc::TryRecvError;
+use std::time::Duration;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub enum Outcome {
     Cancel,
-    Jump(usize),
-    ForceNew(usize),
-    Close(usize),
+    Jump(Row),
+    ForceNew(Row),
+    Close(Row),
+}
+
+pub struct Session {
+    pub outcome: Outcome,
+    pub live_workspace_ids: Option<HashSet<String>>,
+    pub state: PickerState,
 }
 
 // --- tokyo-night palette ---
-const AMBER: Color = Color::Rgb(0xe0, 0xaf, 0x68); // accent (prompt, selection)
-const FG: Color = Color::Rgb(0xc0, 0xca, 0xf5); // primary text
-const MUTED: Color = Color::Rgb(0x56, 0x5f, 0x89); // comments / dim
-const FAINT: Color = Color::Rgb(0x3b, 0x42, 0x61); // dividers / placeholders
-const SEL_BG: Color = Color::Rgb(0x2a, 0x27, 0x1c); // amber-tinted selection
+const AMBER: Color = Color::Rgb(0xe0, 0xaf, 0x68);
+const FG: Color = Color::Rgb(0xc0, 0xca, 0xf5);
+const MUTED: Color = Color::Rgb(0x56, 0x5f, 0x89);
+const FAINT: Color = Color::Rgb(0x3b, 0x42, 0x61);
+const SEL_BG: Color = Color::Rgb(0x2a, 0x27, 0x1c);
 const RED: Color = Color::Rgb(0xf7, 0x76, 0x8e);
 const CYAN: Color = Color::Rgb(0x7d, 0xcf, 0xff);
 const GREEN: Color = Color::Rgb(0x9e, 0xce, 0x6a);
 
 const NAME_W: usize = 20;
-const GLYPH_W: usize = 2; // glyph + space
-const HL_W: usize = 2; // highlight symbol width ("▌ ")
+const GLYPH_W: usize = 2;
+const HL_W: usize = 2;
+const EVENT_POLL: Duration = Duration::from_millis(50);
 
-fn state_color(s: AgentState) -> Color {
-    match s {
+struct TerminalGuard {
+    raw_mode: bool,
+    alternate_screen: bool,
+}
+
+impl TerminalGuard {
+    fn enter() -> io::Result<Self> {
+        let mut guard = TerminalGuard {
+            raw_mode: false,
+            alternate_screen: false,
+        };
+        terminal::enable_raw_mode()?;
+        guard.raw_mode = true;
+        if let Err(error) = execute!(stdout(), terminal::EnterAlternateScreen) {
+            let _ = guard.restore();
+            return Err(error);
+        }
+        guard.alternate_screen = true;
+        if let Err(error) = execute!(stdout(), cursor::Hide) {
+            let _ = guard.restore();
+            return Err(error);
+        }
+        Ok(guard)
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        let mut failure = None;
+        if self.alternate_screen {
+            if let Err(error) = execute!(stdout(), cursor::Show, terminal::LeaveAlternateScreen) {
+                failure = Some(error);
+            }
+            self.alternate_screen = false;
+        } else if let Err(error) = execute!(stdout(), cursor::Show) {
+            failure = Some(error);
+        }
+        if self.raw_mode {
+            if let Err(error) = terminal::disable_raw_mode() {
+                if failure.is_none() {
+                    failure = Some(error);
+                }
+            }
+            self.raw_mode = false;
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[derive(Default)]
+pub struct PickerState {
+    rows: Vec<Row>,
+    query: String,
+    selected: usize,
+}
+
+impl PickerState {
+    fn filtered(&self, matcher: &mut Matcher) -> Vec<usize> {
+        filter(&self.rows, &self.query, matcher)
+    }
+
+    fn apply_snapshot(&mut self, snapshot: Snapshot, matcher: &mut Matcher) {
+        let old_filtered = self.filtered(matcher);
+        let selected_id = old_filtered
+            .get(self.selected)
+            .map(|index| self.rows[*index].id());
+
+        self.rows = snapshot.rows;
+        let filtered = self.filtered(matcher);
+        self.selected = selected_id
+            .and_then(|id| {
+                filtered
+                    .iter()
+                    .position(|index| self.rows[*index].id() == id)
+            })
+            .unwrap_or(0);
+        if self.selected >= filtered.len() {
+            self.selected = filtered.len().saturating_sub(1);
+        }
+    }
+
+    fn apply_partial(&mut self, mut snapshot: Snapshot, matcher: &mut Matcher) {
+        // Project discovery has not completed yet. Retain the last known
+        // dormant rows so a loading refresh cannot make them disappear.
+        let refreshed_ids: HashSet<_> = snapshot.rows.iter().map(Row::id).collect();
+        snapshot.rows.extend(
+            self.rows
+                .iter()
+                .filter(|row| matches!(row.kind, Kind::Dormant))
+                .filter(|row| !refreshed_ids.contains(&row.id()))
+                .cloned(),
+        );
+        self.apply_snapshot(snapshot, matcher);
+    }
+
+    pub fn remove(&mut self, id: &crate::model::RowId) {
+        self.rows.retain(|row| row.id() != *id);
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+        let filtered = self.filtered(&mut matcher);
+        self.selected = self.selected.min(filtered.len().saturating_sub(1));
+    }
+
+    fn selected_row(&self, filtered: &[usize]) -> Option<Row> {
+        filtered
+            .get(self.selected)
+            .map(|index| self.rows[*index].clone())
+    }
+}
+
+fn state_color(state: AgentState) -> Color {
+    match state {
         AgentState::Blocked => RED,
         AgentState::Working => CYAN,
         AgentState::Done => GREEN,
-        AgentState::Idle => MUTED,
-        AgentState::Unknown => MUTED,
+        AgentState::Idle | AgentState::Unknown => MUTED,
     }
 }
 
-/// Returns original row indices, ranked. Empty query keeps assembled order.
+struct SearchDocument(String);
+
+impl SearchDocument {
+    fn for_row(row: &Row) -> Self {
+        let mut fields = Vec::new();
+        push_unique(&mut fields, row.name.clone());
+        push_unique(&mut fields, row.display.clone());
+
+        if let Kind::Open { state, agent, .. } = &row.kind {
+            push_unique(&mut fields, row.path.display().to_string());
+            push_unique(&mut fields, state.word().to_string());
+            if let Some(agent) = agent {
+                push_unique(&mut fields, agent.clone());
+            }
+            for pane_name in &row.pane_names {
+                push_unique(&mut fields, pane_name.clone());
+            }
+        }
+
+        SearchDocument(fields.join(" "))
+    }
+}
+
+fn push_unique(fields: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !fields.iter().any(|existing| existing == &value) {
+        fields.push(value);
+    }
+}
+
+/// Return original row indices, ranked within each section. Open rows always
+/// precede project rows, including when the query is empty.
 fn filter(rows: &[Row], query: &str, matcher: &mut Matcher) -> Vec<usize> {
     if query.is_empty() {
-        return (0..rows.len()).collect();
+        let (open, projects): (Vec<_>, Vec<_>) =
+            (0..rows.len()).partition(|index| matches!(rows[*index].kind, Kind::Open { .. }));
+        return open.into_iter().chain(projects).collect();
     }
-    let pat = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
-    let mut buf = Vec::new();
-    let mut scored: Vec<(u32, usize)> = rows
+
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut buffer = Vec::new();
+    let mut open = Vec::new();
+    let mut projects = Vec::new();
+
+    for (index, row) in rows.iter().enumerate() {
+        let document = SearchDocument::for_row(row);
+        let haystack = Utf32Str::new(&document.0, &mut buffer);
+        let Some(score) = pattern.score(haystack, matcher) else {
+            continue;
+        };
+        if matches!(row.kind, Kind::Open { .. }) {
+            open.push((score, index));
+        } else {
+            projects.push((score, index));
+        }
+    }
+
+    let rank = |a: &(u32, usize), b: &(u32, usize)| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1));
+    open.sort_by(rank);
+    projects.sort_by(rank);
+    open.into_iter()
+        .chain(projects)
+        .map(|(_, index)| index)
+        .collect()
+}
+
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
+}
+
+fn truncate_to_width(value: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if display_width(value) <= max_width {
+        return value.to_string();
+    }
+
+    let ellipsis = "…";
+    let content_width = max_width.saturating_sub(display_width(ellipsis));
+    let mut result = String::new();
+    let mut used = 0;
+    for grapheme in UnicodeSegmentation::graphemes(value, true) {
+        let width = display_width(grapheme);
+        if used + width > content_width {
+            break;
+        }
+        result.push_str(grapheme);
+        used += width;
+    }
+    result.push_str(ellipsis);
+    result
+}
+
+fn pad_to_width(value: &str, width: usize) -> String {
+    let value = truncate_to_width(value, width);
+    let padding = width.saturating_sub(display_width(&value));
+    format!("{value}{}", " ".repeat(padding))
+}
+
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans
         .iter()
-        .enumerate()
-        .filter_map(|(i, r)| {
-            let hay_str = format!("{} {}", r.name, r.display);
-            let hay = Utf32Str::new(&hay_str, &mut buf);
-            pat.score(hay, matcher).map(|s| (s, i))
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored.into_iter().map(|(_, i)| i).collect()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum()
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else if max <= 1 {
-        "…".to_string()
-    } else {
-        let head: String = s.chars().take(max - 1).collect();
-        format!("{head}…")
+fn truncate_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Span<'static>> {
+    let mut remaining = max_width;
+    let mut output = Vec::new();
+    for span in spans {
+        if remaining == 0 {
+            break;
+        }
+        let original_width = display_width(span.content.as_ref());
+        let content = truncate_to_width(span.content.as_ref(), remaining);
+        let width = display_width(&content);
+        output.push(Span::styled(content, span.style));
+        remaining = remaining.saturating_sub(width);
+        if original_width > width {
+            break;
+        }
+    }
+    output
+}
+
+fn pane_label(row: &Row) -> String {
+    let mut seen = HashSet::new();
+    let unique: Vec<&str> = row
+        .pane_names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| seen.insert(*name))
+        .collect();
+    match unique.as_slice() {
+        [] => row.name.clone(),
+        [name] => (*name).to_string(),
+        [first, second] => format!("{first} · {second}"),
+        [first, second, rest @ ..] => format!("{first} · {second} +{}", rest.len()),
     }
 }
 
-/// One row, meta right-aligned to `w` columns (the list's inner content width).
-fn row_line(r: &Row, w: usize) -> Line<'static> {
-    match &r.kind {
+fn body_spans(
+    name: &str,
+    path: &str,
+    budget: usize,
+    name_style: Style,
+    path_style: Style,
+) -> Vec<Span<'static>> {
+    if budget == 0 {
+        return Vec::new();
+    }
+    if path.is_empty() || budget < 14 {
+        return vec![Span::styled(truncate_to_width(name, budget), name_style)];
+    }
+
+    let name_budget = NAME_W.min(budget.saturating_sub(5));
+    let path_budget = budget.saturating_sub(name_budget + 1);
+    vec![
+        Span::styled(pad_to_width(name, name_budget), name_style),
+        Span::raw(" "),
+        Span::styled(truncate_to_width(path, path_budget), path_style),
+    ]
+}
+
+/// One row constrained to `width` terminal display columns.
+fn row_line(row: &Row, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+
+    match &row.kind {
         Kind::Open { state, agent, .. } => {
             let color = state_color(*state);
-            let name = format!("{:<NAME_W$}", truncate(&r.name, NAME_W));
-            let meta = match agent {
-                Some(a) => format!("{a} · {}", state.word()),
+            let glyph = truncate_to_width(&format!("{} ", state.glyph()), width.min(GLYPH_W));
+            let glyph_width = display_width(&glyph);
+            let remaining = width.saturating_sub(glyph_width);
+
+            let full_meta = match agent {
+                Some(agent) => format!("{agent} · {}", state.word()),
                 None => state.word().to_string(),
             };
-            let meta_len = meta.chars().count();
-            // columns left for path + gap + meta
-            let prefix = GLYPH_W + NAME_W + 1;
-            let rest = w.saturating_sub(prefix);
-            let path_field = rest.saturating_sub(meta_len + 1).max(4);
-            let path = truncate(&r.display, path_field);
-            let pad = rest
-                .saturating_sub(path.chars().count() + meta_len)
-                .max(1);
-            Line::from(vec![
-                Span::styled(format!("{} ", state.glyph()), Style::default().fg(color)),
-                Span::styled(name, Style::default().fg(FG).add_modifier(Modifier::BOLD)),
-                Span::raw(" "),
-                Span::styled(path, Style::default().fg(MUTED)),
-                Span::raw(" ".repeat(pad)),
-                Span::styled(meta, Style::default().fg(color)),
-            ])
+            let meta = if width >= 30 {
+                truncate_to_width(&full_meta, (width / 3).min(20))
+            } else {
+                String::new()
+            };
+            let meta_width = display_width(&meta);
+            let meta_gap = usize::from(!meta.is_empty() && remaining > meta_width);
+            let body_budget = remaining.saturating_sub(meta_width + meta_gap);
+            let mut body = body_spans(
+                &pane_label(row),
+                &row.display,
+                body_budget,
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+                Style::default().fg(MUTED),
+            );
+            let body_width = spans_width(&body);
+            if body_width < body_budget {
+                body.push(Span::raw(" ".repeat(body_budget - body_width)));
+            }
+
+            let mut spans = vec![Span::styled(glyph, Style::default().fg(color))];
+            spans.extend(body);
+            if meta_gap > 0 {
+                spans.push(Span::raw(" "));
+            }
+            if !meta.is_empty() {
+                spans.push(Span::styled(meta, Style::default().fg(color)));
+            }
+            Line::from(truncate_spans(spans, width))
         }
         Kind::Dormant => {
-            let name = format!("{:<NAME_W$}", truncate(&r.name, NAME_W));
-            Line::from(vec![
-                Span::raw(" ".repeat(GLYPH_W)),
-                Span::styled(name, Style::default().fg(FG)),
-                Span::raw(" "),
-                Span::styled(r.display.clone(), Style::default().fg(FAINT)),
-            ])
+            let glyph = " ".repeat(width.min(GLYPH_W));
+            let body_budget = width.saturating_sub(display_width(&glyph));
+            let mut spans = vec![Span::raw(glyph)];
+            spans.extend(body_spans(
+                &row.name,
+                &row.display,
+                body_budget,
+                Style::default().fg(FG),
+                Style::default().fg(FAINT),
+            ));
+            Line::from(truncate_spans(spans, width))
         }
     }
 }
 
-fn header_item(label: &str, suffix: &str) -> ListItem<'static> {
-    ListItem::new(Line::from(vec![
+fn header_item(label: &str, suffix: &str, width: usize) -> ListItem<'static> {
+    let spans = vec![
         Span::styled(
             format!("▸ {label} "),
             Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("— {suffix}"), Style::default().fg(FAINT)),
-    ]))
+    ];
+    ListItem::new(Line::from(truncate_spans(spans, width)))
 }
 
-/// Build list items (headers shown only while browsing) + the list position of
-/// the selected filtered row.
 fn build(
     rows: &[Row],
     filtered: &[usize],
-    sel: usize,
-    show_headers: bool,
-    w: usize,
+    selected: usize,
+    width: usize,
 ) -> (Vec<ListItem<'static>>, usize) {
     let mut items = Vec::new();
-    let mut sel_pos = 0;
-    let mut last_group: Option<u8> = None;
-    for (fi, &ri) in filtered.iter().enumerate() {
-        let r = &rows[ri];
-        let group = match r.kind {
-            Kind::Open { .. } => 0u8,
-            Kind::Dormant => 1u8,
+    let mut selected_position = 0;
+    let mut last_group = None;
+    for (filtered_index, row_index) in filtered.iter().copied().enumerate() {
+        let row = &rows[row_index];
+        let group = if matches!(row.kind, Kind::Open { .. }) {
+            0u8
+        } else {
+            1u8
         };
-        if show_headers && last_group != Some(group) {
+        if last_group != Some(group) {
             items.push(header_item(
                 if group == 0 { "OPEN" } else { "PROJECTS" },
-                if group == 0 { "LIVE WORKSPACES" } else { "NOT OPEN YET" },
+                if group == 0 {
+                    "LIVE WORKSPACES"
+                } else {
+                    "NOT OPEN YET"
+                },
+                width,
             ));
             last_group = Some(group);
         }
-        if fi == sel {
-            sel_pos = items.len();
+        if filtered_index == selected {
+            selected_position = items.len();
         }
-        items.push(ListItem::new(row_line(r, w)));
+        items.push(ListItem::new(row_line(row, width)));
     }
-    (items, sel_pos)
+    (items, selected_position)
 }
 
-/// A right-aligned pair of lines: fill `text_left` then push `text_right` to `w`.
-fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, w: usize) -> Line<'static> {
-    let lw: usize = left.iter().map(|s| s.content.chars().count()).sum();
-    let rw: usize = right.iter().map(|s| s.content.chars().count()).sum();
-    let pad = w.saturating_sub(lw + rw).max(1);
-    let mut spans = left;
-    spans.push(Span::raw(" ".repeat(pad)));
-    spans.extend(right);
-    Line::from(spans)
+fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+    let right = truncate_spans(right, width / 3);
+    let right_width = spans_width(&right);
+    let gap = usize::from(right_width > 0 && width > right_width);
+    let left_budget = width.saturating_sub(right_width + gap);
+    let mut left = truncate_spans(left, left_budget);
+    let left_width = spans_width(&left);
+    left.push(Span::raw(
+        " ".repeat(width.saturating_sub(left_width + right_width)),
+    ));
+    left.extend(right);
+    Line::from(truncate_spans(left, width))
 }
 
 fn keycap(key: &str, label: &str) -> Vec<Span<'static>> {
@@ -173,150 +465,406 @@ fn keycap(key: &str, label: &str) -> Vec<Span<'static>> {
     ]
 }
 
-pub fn run(rows: &[Row]) -> std::io::Result<Outcome> {
-    terminal::enable_raw_mode()?;
-    execute!(stdout(), terminal::EnterAlternateScreen)?;
-    let mut term = Terminal::new(CrosstermBackend::new(stdout()))?;
+fn empty_item(loading: bool, error: Option<&str>, query: &str, width: usize) -> ListItem<'static> {
+    let (message, color) = if loading {
+        (
+            if query.is_empty() {
+                "Loading workspaces and projects…"
+            } else {
+                "No matches yet — still loading…"
+            },
+            MUTED,
+        )
+    } else if let Some(error) = error {
+        (error, RED)
+    } else if query.is_empty() {
+        ("No projects configured", MUTED)
+    } else {
+        ("No matches", MUTED)
+    };
+    ListItem::new(Line::from(vec![Span::styled(
+        truncate_to_width(message, width),
+        Style::default().fg(color),
+    )]))
+}
+
+pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
+    let mut terminal_guard = TerminalGuard::enter()?;
+    let mut terminal = match Terminal::new(CrosstermBackend::new(stdout())) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            if let Err(restore_error) = terminal_guard.restore() {
+                eprintln!("herdr-muster: restore terminal: {restore_error}");
+            }
+            return Err(error);
+        }
+    };
     let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
-    let mut query = String::new();
-    let mut sel: usize = 0;
+    let mut loading = true;
+    let mut refresh_error: Option<String> = None;
+    let mut live_workspace_ids = None;
+    let mut channel_open = true;
     let mut outcome = Outcome::Cancel;
 
-    let open_n = rows.iter().filter(|r| matches!(r.kind, Kind::Open { .. })).count();
-    let dormant_n = rows.len() - open_n;
-
-    loop {
-        let filtered = filter(rows, &query, &mut matcher);
-        if sel >= filtered.len() {
-            sel = filtered.len().saturating_sub(1);
-        }
-
-        term.draw(|f| {
-            let area = f.area();
-            let title_left = Line::from(vec![Span::styled(
-                " one terminal for the whole herd ",
-                Style::default().fg(MUTED),
-            )])
-            .left_aligned();
-            let title_right = Line::from(vec![
-                Span::styled(format!(" {open_n} open"), Style::default().fg(GREEN)),
-                Span::styled(" · ", Style::default().fg(FAINT)),
-                Span::styled(format!("{dormant_n} idle "), Style::default().fg(MUTED)),
-            ])
-            .right_aligned();
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(FAINT))
-                .title_top(title_left)
-                .title_top(title_right);
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-
-            let v = Layout::vertical([
-                Constraint::Length(1), // prompt
-                Constraint::Length(1), // divider
-                Constraint::Min(1),    // list
-                Constraint::Length(1), // divider
-                Constraint::Length(1), // footer
-            ])
-            .horizontal_margin(1)
-            .split(inner);
-
-            let w = v[2].width as usize;
-
-            // prompt row
-            let query_span = if query.is_empty() {
-                Span::styled("type to fuzzy-filter…", Style::default().fg(FAINT))
-            } else {
-                Span::styled(query.clone(), Style::default().fg(FG))
-            };
-            let prompt = spread(
-                vec![
-                    Span::styled("› ", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
-                    query_span,
-                ],
-                vec![Span::styled(
-                    format!("{} matches", filtered.len()),
-                    Style::default().fg(MUTED),
-                )],
-                w,
-            );
-            f.render_widget(Paragraph::new(prompt), v[0]);
-
-            let rule = "─".repeat(w);
-            let rule_style = Style::default().fg(FAINT);
-            f.render_widget(Paragraph::new(rule.clone()).style(rule_style), v[1]);
-            f.render_widget(Paragraph::new(rule).style(rule_style), v[3]);
-
-            let list_w = w.saturating_sub(HL_W);
-            let (items, sel_pos) = build(rows, &filtered, sel, query.is_empty(), list_w);
-            let mut st = ListState::default();
-            if !filtered.is_empty() {
-                st.select(Some(sel_pos));
+    let result = (|| -> io::Result<Session> {
+        loop {
+            while channel_open {
+                match updates.try_recv() {
+                    Ok(RefreshMessage::Partial(snapshot)) => {
+                        live_workspace_ids = Some(snapshot.live_workspace_ids.clone());
+                        state.apply_partial(snapshot, &mut matcher);
+                        loading = true;
+                        refresh_error = None;
+                    }
+                    Ok(RefreshMessage::Ready(snapshot)) => {
+                        live_workspace_ids = Some(snapshot.live_workspace_ids.clone());
+                        state.apply_snapshot(snapshot, &mut matcher);
+                        loading = false;
+                        refresh_error = None;
+                    }
+                    Ok(RefreshMessage::Failed(error)) => {
+                        loading = false;
+                        refresh_error = Some(format!("Refresh failed: {error}"));
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        channel_open = false;
+                        if loading {
+                            loading = false;
+                            refresh_error = Some("Refresh stopped before completion".into());
+                        }
+                    }
+                }
             }
-            let list = List::new(items)
-                .highlight_style(Style::default().bg(SEL_BG))
-                .highlight_symbol("▌ ");
-            f.render_stateful_widget(list, v[2], &mut st);
 
-            // footer keycaps
-            let mut footer = Vec::new();
-            footer.extend(keycap("↵", "jump / create"));
-            footer.extend(keycap("^n", "force new"));
-            footer.extend(keycap("^x", "close"));
-            footer.extend(keycap("esc", "cancel"));
-            f.render_widget(Paragraph::new(Line::from(footer)), v[4]);
-        })?;
+            let filtered = state.filtered(&mut matcher);
+            if state.selected >= filtered.len() {
+                state.selected = filtered.len().saturating_sub(1);
+            }
+            let open_count = state
+                .rows
+                .iter()
+                .filter(|row| matches!(row.kind, Kind::Open { .. }))
+                .count();
+            let dormant_count = state.rows.len() - open_count;
 
-        if let Event::Key(k) = event::read()? {
-            if k.kind != KeyEventKind::Press {
+            terminal.draw(|frame| {
+                let area = frame.area();
+                let title_left = Line::from(vec![Span::styled(
+                    " one terminal for the whole herd ",
+                    Style::default().fg(MUTED),
+                )])
+                .left_aligned();
+                let mut title_spans = vec![
+                    Span::styled(format!(" {open_count} open"), Style::default().fg(GREEN)),
+                    Span::styled(" · ", Style::default().fg(FAINT)),
+                    Span::styled(format!("{dormant_count} idle"), Style::default().fg(MUTED)),
+                ];
+                if loading {
+                    title_spans.push(Span::styled(" · loading ", Style::default().fg(AMBER)));
+                } else if refresh_error.is_some() {
+                    title_spans.push(Span::styled(" · refresh failed ", Style::default().fg(RED)));
+                } else {
+                    title_spans.push(Span::raw(" "));
+                }
+                let title_right = Line::from(title_spans).right_aligned();
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(FAINT))
+                    .title_top(title_left)
+                    .title_top(title_right);
+                let inner = block.inner(area);
+                frame.render_widget(block, area);
+
+                let vertical = Layout::vertical([
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                ])
+                .horizontal_margin(1)
+                .split(inner);
+                let width = vertical[2].width as usize;
+
+                let query_span = if state.query.is_empty() {
+                    Span::styled("type to fuzzy-filter…", Style::default().fg(FAINT))
+                } else {
+                    Span::styled(state.query.clone(), Style::default().fg(FG))
+                };
+                let prompt = spread(
+                    vec![
+                        Span::styled(
+                            "› ",
+                            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+                        ),
+                        query_span,
+                    ],
+                    vec![Span::styled(
+                        format!("{} matches", filtered.len()),
+                        Style::default().fg(MUTED),
+                    )],
+                    width,
+                );
+                frame.render_widget(Paragraph::new(prompt), vertical[0]);
+
+                let rule = "─".repeat(width);
+                let rule_style = Style::default().fg(FAINT);
+                frame.render_widget(Paragraph::new(rule.clone()).style(rule_style), vertical[1]);
+                frame.render_widget(Paragraph::new(rule).style(rule_style), vertical[3]);
+
+                let list_width = width.saturating_sub(HL_W);
+                let (items, selected_position) = if filtered.is_empty() {
+                    (
+                        vec![empty_item(
+                            loading,
+                            refresh_error.as_deref(),
+                            &state.query,
+                            list_width,
+                        )],
+                        0,
+                    )
+                } else {
+                    build(&state.rows, &filtered, state.selected, list_width)
+                };
+                let mut list_state = ListState::default();
+                if !filtered.is_empty() {
+                    list_state.select(Some(selected_position));
+                }
+                let list = List::new(items)
+                    .highlight_style(Style::default().bg(SEL_BG))
+                    .highlight_symbol("▌ ");
+                frame.render_stateful_widget(list, vertical[2], &mut list_state);
+
+                let mut footer = Vec::new();
+                footer.extend(keycap("↵", "jump / create"));
+                footer.extend(keycap("^n", "force new"));
+                footer.extend(keycap("^x", "close"));
+                footer.extend(keycap("esc", "cancel"));
+                frame.render_widget(
+                    Paragraph::new(Line::from(truncate_spans(footer, width))),
+                    vertical[4],
+                );
+            })?;
+
+            if !event::poll(EVENT_POLL)? {
                 continue;
             }
-            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-            match k.code {
+            let Event::Key(key) = event::read()? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            let control = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
                 KeyCode::Esc => break,
-                KeyCode::Char('c') if ctrl => break,
+                KeyCode::Char('c') if control => break,
                 KeyCode::Enter => {
-                    if let Some(&ri) = filtered.get(sel) {
-                        outcome = Outcome::Jump(ri);
+                    if let Some(row) = state.selected_row(&filtered) {
+                        outcome = Outcome::Jump(row);
                         break;
                     }
                 }
-                KeyCode::Char('n') if ctrl => {
-                    if let Some(&ri) = filtered.get(sel) {
-                        outcome = Outcome::ForceNew(ri);
+                KeyCode::Char('n') if control => {
+                    if let Some(row) = state.selected_row(&filtered) {
+                        outcome = Outcome::ForceNew(row);
                         break;
                     }
                 }
-                KeyCode::Char('x') if ctrl => {
-                    if let Some(&ri) = filtered.get(sel) {
-                        if matches!(rows[ri].kind, Kind::Open { .. }) {
-                            outcome = Outcome::Close(ri);
+                KeyCode::Char('x') if control => {
+                    if let Some(row) = state.selected_row(&filtered) {
+                        if matches!(row.kind, Kind::Open { .. }) {
+                            outcome = Outcome::Close(row);
                             break;
                         }
                     }
                 }
-                KeyCode::Up => sel = sel.saturating_sub(1),
+                KeyCode::Up => state.selected = state.selected.saturating_sub(1),
                 KeyCode::Down => {
-                    if sel + 1 < filtered.len() {
-                        sel += 1;
+                    if state.selected + 1 < filtered.len() {
+                        state.selected += 1;
                     }
                 }
                 KeyCode::Backspace => {
-                    query.pop();
-                    sel = 0;
+                    state.query.pop();
+                    state.selected = 0;
                 }
-                KeyCode::Char(c) if !ctrl => {
-                    query.push(c);
-                    sel = 0;
+                KeyCode::Char(character) if !control => {
+                    state.query.push(character);
+                    state.selected = 0;
                 }
                 _ => {}
             }
         }
+
+        Ok(Session {
+            outcome,
+            live_workspace_ids,
+            state,
+        })
+    })();
+    match terminal_guard.restore() {
+        Ok(()) => result,
+        Err(error) if result.is_ok() => Err(error),
+        Err(error) => {
+            eprintln!("herdr-muster: restore terminal: {error}");
+            result
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::RowId;
+    use std::path::PathBuf;
+
+    fn open(name: &str, display: &str, path: &str, pane_names: &[&str]) -> Row {
+        Row {
+            name: name.into(),
+            path: PathBuf::from(path),
+            display: display.into(),
+            pane_names: pane_names.iter().map(|name| (*name).into()).collect(),
+            kind: Kind::Open {
+                workspace_id: name.into(),
+                state: AgentState::Working,
+                agent: Some("claude".into()),
+            },
+        }
     }
 
-    execute!(stdout(), terminal::LeaveAlternateScreen)?;
-    terminal::disable_raw_mode()?;
-    Ok(outcome)
+    fn project(name: &str, display: &str, path: &str) -> Row {
+        Row {
+            name: name.into(),
+            path: PathBuf::from(path),
+            display: display.into(),
+            pane_names: Vec::new(),
+            kind: Kind::Dormant,
+        }
+    }
+
+    #[test]
+    fn filtering_groups_sections_even_when_project_scores_higher() {
+        let rows = vec![
+            project("api", "~/api", "/Users/me/api"),
+            open("workspace", "~/work", "/Users/me/work", &["api-dashboard"]),
+        ];
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+
+        assert_eq!(filter(&rows, "api", &mut matcher), vec![1, 0]);
+        assert_eq!(filter(&rows, "", &mut matcher), vec![1, 0]);
+    }
+
+    #[test]
+    fn searches_full_open_paths_and_open_only_metadata() {
+        let rows = vec![
+            open("web", "~/web", "/Users/me/web", &["backend"]),
+            project("web", "~/web", "/Users/me/web"),
+        ];
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+
+        assert_eq!(filter(&rows, "/Users/me/web", &mut matcher), vec![0]);
+        assert_eq!(filter(&rows, "backend", &mut matcher), vec![0]);
+        assert_eq!(filter(&rows, "claude", &mut matcher), vec![0]);
+        assert_eq!(filter(&rows, "working", &mut matcher), vec![0]);
+    }
+
+    #[test]
+    fn snapshot_updates_keep_query_and_selection_identity() {
+        let mut state = PickerState {
+            rows: vec![
+                open("one", "~/one", "/one", &[]),
+                open("two", "~/two", "/two", &[]),
+            ],
+            query: "o".into(),
+            selected: 1,
+        };
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+        let snapshot = Snapshot {
+            rows: vec![
+                open("two", "~/two", "/two", &[]),
+                open("one", "~/one", "/one", &[]),
+            ],
+            live_workspace_ids: HashSet::new(),
+        };
+
+        state.apply_snapshot(snapshot, &mut matcher);
+
+        assert_eq!(state.query, "o");
+        let filtered = state.filtered(&mut matcher);
+        assert_eq!(
+            state.selected_row(&filtered).unwrap().id(),
+            RowId::Open("two".into())
+        );
+    }
+
+    #[test]
+    fn partial_refresh_retains_filtered_dormant_selection() {
+        let mut state = PickerState {
+            rows: vec![
+                open("open", "~/open", "/open", &[]),
+                project("dormant", "~/dormant", "/dormant"),
+            ],
+            query: "dorm".into(),
+            selected: 0,
+        };
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+        state.apply_partial(
+            Snapshot {
+                rows: vec![open("open", "~/open", "/open", &[])],
+                live_workspace_ids: HashSet::from(["open".into()]),
+            },
+            &mut matcher,
+        );
+
+        let filtered = state.filtered(&mut matcher);
+        assert_eq!(state.query, "dorm");
+        assert_eq!(
+            state.selected_row(&filtered).unwrap().id(),
+            RowId::Project(PathBuf::from("/dormant"))
+        );
+    }
+
+    #[test]
+    fn row_rendering_never_exceeds_available_width() {
+        let open_row = open(
+            "api",
+            "~/a/very/long/path",
+            "/a/very/long/path",
+            &["界界界界界界界界界界", "editor", "editor", "tests"],
+        );
+        let project_row = project("project", "~/a/very/long/project/path", "/project");
+
+        for width in 0..80 {
+            assert!(
+                row_line(&open_row, width).width() <= width,
+                "open width {width}"
+            );
+            assert!(
+                row_line(&project_row, width).width() <= width,
+                "project width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_is_grapheme_and_display_width_aware() {
+        assert_eq!(display_width(&truncate_to_width("界界界", 5)), 5);
+        assert_eq!(truncate_to_width("e\u{301}clair", 2), "e\u{301}…");
+        assert_eq!(truncate_to_width("hello", 0), "");
+    }
+
+    #[test]
+    fn display_deduplicates_names_and_reports_more() {
+        let row = open(
+            "api",
+            "~/api",
+            "/api",
+            &["editor", "editor", "tests", "shell"],
+        );
+        assert_eq!(pane_label(&row), "editor · tests +1");
+    }
 }

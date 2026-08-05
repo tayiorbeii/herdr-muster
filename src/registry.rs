@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -7,46 +9,80 @@ pub struct Registry {
     map: HashMap<String, String>,
 }
 
-fn key(dir: &Path) -> String {
-    dir.to_string_lossy().to_string()
+fn normalize_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn key(directory: &Path) -> String {
+    normalize_path(directory).to_string_lossy().into_owned()
 }
 
 impl Registry {
     pub fn load(path: &Path) -> Registry {
-        match std::fs::read_to_string(path) {
+        let registry: Registry = match fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
             Err(_) => Registry::default(),
+        };
+
+        Registry {
+            map: registry
+                .map
+                .into_iter()
+                .map(|(directory, workspace)| (key(Path::new(&directory)), workspace))
+                .collect(),
         }
     }
 
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("state.json");
+        let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+        let text = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
+
+        let result = (|| -> io::Result<()> {
+            let mut file = File::create(&temporary)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&temporary, path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
         }
-        let text = serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".into());
-        std::fs::write(path, text)
+        result
     }
 
-    pub fn workspace_for(&self, dir: &Path) -> Option<&String> {
-        self.map.get(&key(dir))
+    #[cfg(test)]
+    pub fn workspace_for(&self, directory: &Path) -> Option<&String> {
+        self.map.get(&key(directory))
     }
 
-    pub fn bind(&mut self, dir: &Path, ws: &str) {
-        self.map.insert(key(dir), ws.to_string());
+    pub fn bind(&mut self, directory: &Path, workspace: &str) {
+        self.map.insert(key(directory), workspace.to_string());
     }
 
-    pub fn unbind(&mut self, dir: &Path) {
-        self.map.remove(&key(dir));
+    pub fn unbind(&mut self, directory: &Path) {
+        self.map.remove(&key(directory));
     }
 
     pub fn reconcile(&mut self, live: &HashSet<String>) -> bool {
         let before = self.map.len();
-        self.map.retain(|_, ws| live.contains(ws));
+        self.map.retain(|_, workspace| live.contains(workspace));
         before != self.map.len()
     }
 
     pub fn live_map(&self) -> HashMap<PathBuf, String> {
-        self.map.iter().map(|(k, v)| (PathBuf::from(k), v.clone())).collect()
+        self.map
+            .iter()
+            .map(|(directory, workspace)| (PathBuf::from(directory), workspace.clone()))
+            .collect()
     }
 }
 
@@ -56,40 +92,76 @@ mod tests {
 
     #[test]
     fn bind_unbind_lookup() {
-        let mut r = Registry::default();
-        r.bind(Path::new("/a"), "w1");
-        assert_eq!(r.workspace_for(Path::new("/a")).map(String::as_str), Some("w1"));
-        r.unbind(Path::new("/a"));
-        assert!(r.workspace_for(Path::new("/a")).is_none());
+        let mut registry = Registry::default();
+        registry.bind(Path::new("/a"), "w1");
+        assert_eq!(
+            registry.workspace_for(Path::new("/a")).map(String::as_str),
+            Some("w1")
+        );
+        registry.unbind(Path::new("/a"));
+        assert!(registry.workspace_for(Path::new("/a")).is_none());
     }
 
     #[test]
     fn reconcile_drops_dead() {
-        let mut r = Registry::default();
-        r.bind(Path::new("/a"), "w1");
-        r.bind(Path::new("/b"), "w2");
+        let mut registry = Registry::default();
+        registry.bind(Path::new("/a"), "w1");
+        registry.bind(Path::new("/b"), "w2");
         let live: HashSet<String> = ["w2".to_string()].into_iter().collect();
-        assert!(r.reconcile(&live));
-        assert!(r.workspace_for(Path::new("/a")).is_none());
-        assert_eq!(r.workspace_for(Path::new("/b")).map(String::as_str), Some("w2"));
+        assert!(registry.reconcile(&live));
+        assert!(registry.workspace_for(Path::new("/a")).is_none());
+        assert_eq!(
+            registry.workspace_for(Path::new("/b")).map(String::as_str),
+            Some("w2")
+        );
     }
 
     #[test]
-    fn save_load_roundtrip() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("sub").join("state.json");
-        let mut r = Registry::default();
-        r.bind(Path::new("/a"), "w1");
-        r.save(&path).unwrap();
-        let r2 = Registry::load(&path);
-        assert_eq!(r2.workspace_for(Path::new("/a")).map(String::as_str), Some("w1"));
+    fn save_load_roundtrip_is_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sub").join("state.json");
+        let mut registry = Registry::default();
+        registry.bind(Path::new("/a"), "w1");
+        registry.save(&path).unwrap();
+
+        let loaded = Registry::load(&path);
+        assert_eq!(
+            loaded.workspace_for(Path::new("/a")).map(String::as_str),
+            Some("w1")
+        );
+        assert!(fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalizes_symlink_keys() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        let alias = directory.path().join("alias");
+        fs::create_dir(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+
+        let mut registry = Registry::default();
+        registry.bind(&alias, "w1");
+        assert_eq!(
+            registry.workspace_for(&real).map(String::as_str),
+            Some("w1")
+        );
     }
 
     #[test]
     fn load_missing_or_corrupt_is_default() {
         assert!(Registry::load(Path::new("/no/such")).live_map().is_empty());
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), "{not json").unwrap();
-        assert!(Registry::load(tmp.path()).live_map().is_empty());
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), "{not json").unwrap();
+        assert!(Registry::load(file.path()).live_map().is_empty());
     }
 }

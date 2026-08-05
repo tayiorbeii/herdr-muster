@@ -2,116 +2,166 @@ mod config;
 mod herdr;
 mod model;
 mod picker;
+mod refresh;
 mod registry;
 mod sources;
 
 use herdr::Herdr;
-use model::{Kind, Row};
+use model::Kind;
 use registry::Registry;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-fn zoxide_lines(enabled: bool) -> Vec<String> {
-    if !enabled {
-        return Vec::new();
-    }
-    let Ok(out) = std::process::Command::new("zoxide").args(["query", "-l"]).output() else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&out.stdout).lines().map(|s| s.to_string()).collect()
-}
-
 fn config_path() -> PathBuf {
     match std::env::var("HERDR_PLUGIN_CONFIG_DIR") {
-        Ok(d) => PathBuf::from(d).join("config.toml"),
+        Ok(directory) => PathBuf::from(directory).join("config.toml"),
         Err(_) => PathBuf::from("config.toml"),
     }
 }
 
 fn state_path() -> PathBuf {
     match std::env::var("HERDR_PLUGIN_STATE_DIR") {
-        Ok(d) => PathBuf::from(d).join("state.json"),
+        Ok(directory) => PathBuf::from(directory).join("state.json"),
         Err(_) => PathBuf::from("state.json"),
     }
 }
 
-fn create_and_bind<H: Herdr>(h: &H, reg: &mut Registry, dir: &Path) -> Result<(), String> {
-    let cwd = dir.to_string_lossy().to_string();
-    let id = h.create_workspace(&cwd, &sources::basename(dir))?;
-    reg.bind(dir, &id);
+fn create_and_bind<H: Herdr>(
+    herdr: &H,
+    registry: &mut Registry,
+    directory: &Path,
+) -> Result<(), String> {
+    let cwd = directory.to_string_lossy().to_string();
+    let id = herdr
+        .create_workspace(&cwd, &sources::basename(directory))
+        .map_err(|error| error.to_string())?;
+    registry.bind(directory, &id);
     Ok(())
+}
+
+fn reconcile_after_refresh(
+    registry: &mut Registry,
+    live_workspace_ids: Option<&HashSet<String>>,
+) -> bool {
+    live_workspace_ids.is_some_and(|live| registry.reconcile(live))
 }
 
 fn run() -> Result<(), String> {
     let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
-    let client = herdr::CliHerdr { bin };
-
-    let cfg = config::Config::load(&config_path())?;
-    let dormant = sources::gather(&cfg, &zoxide_lines(cfg.use_zoxide));
-
-    let reg_path = state_path();
-    let mut reg = Registry::load(&reg_path);
+    let client = herdr::CliHerdr::new(bin);
+    let config_path = config_path();
+    let registry_path = state_path();
+    let mut registry = Registry::load(&registry_path);
     let mut dirty = false;
+    let mut previous_state = picker::PickerState::default();
 
-    let result = (|| -> Result<(), String> {
+    let mut result = (|| -> Result<(), String> {
         loop {
-            let workspaces = client.list_workspaces().unwrap_or_default();
-            let panes = client.list_panes().unwrap_or_default();
-            let live: HashSet<String> =
-                workspaces.iter().map(|w| w.workspace_id.clone()).collect();
-            if reg.reconcile(&live) {
+            let updates = refresh::spawn(client.clone(), config_path.clone(), registry.live_map());
+            let session = picker::run(std::mem::take(&mut previous_state), updates)
+                .map_err(|error| error.to_string())?;
+            let picker::Session {
+                outcome,
+                live_workspace_ids,
+                mut state,
+            } = session;
+
+            if reconcile_after_refresh(&mut registry, live_workspace_ids.as_ref()) {
                 dirty = true;
             }
-            let bound = reg.live_map();
-            let rows: Vec<Row> = model::assemble(&bound, &workspaces, &panes, &dormant);
-            if rows.is_empty() {
-                return Err(format!("no projects — edit {}", config_path().display()));
-            }
 
-            match picker::run(&rows).map_err(|e| e.to_string())? {
+            match outcome {
                 picker::Outcome::Cancel => return Ok(()),
-                picker::Outcome::Jump(i) => {
-                    match &rows[i].kind {
-                        Kind::Open { workspace_id, .. } => client.focus_workspace(workspace_id)?,
+                picker::Outcome::Jump(row) => {
+                    match &row.kind {
+                        Kind::Open { workspace_id, .. } => client
+                            .focus_workspace(workspace_id)
+                            .map_err(|error| error.to_string())?,
                         Kind::Dormant => {
-                            create_and_bind(&client, &mut reg, &rows[i].path)?;
+                            create_and_bind(&client, &mut registry, &row.path)?;
                             dirty = true;
                         }
                     }
                     return Ok(());
                 }
-                picker::Outcome::ForceNew(i) => {
-                    create_and_bind(&client, &mut reg, &rows[i].path)?;
+                picker::Outcome::ForceNew(row) => {
+                    create_and_bind(&client, &mut registry, &row.path)?;
                     dirty = true;
                     return Ok(());
                 }
-                picker::Outcome::Close(i) => {
-                    if let Kind::Open { workspace_id, .. } = &rows[i].kind {
-                        client.close_workspace(workspace_id)?;
-                        reg.unbind(&rows[i].path);
+                picker::Outcome::Close(row) => {
+                    let closed_id = row.id();
+                    if let Kind::Open { workspace_id, .. } = &row.kind {
+                        client
+                            .close_workspace(workspace_id)
+                            .map_err(|error| error.to_string())?;
+                        registry.unbind(&row.path);
                         dirty = true;
                     }
-                    continue; // re-assemble and re-open
+                    state.remove(&closed_id);
+                    previous_state = state;
                 }
             }
         }
     })();
 
     if dirty {
-        let _ = reg.save(&reg_path);
+        if let Err(error) = registry.save(&registry_path) {
+            let save_error = format!("save {}: {error}", registry_path.display());
+            if result.is_ok() {
+                result = Err(save_error);
+            } else {
+                eprintln!("herdr-muster: {save_error}");
+            }
+        }
     }
     if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
-        let _ = client.close_pane(&pane);
+        if let Err(error) = client.close_pane(&pane) {
+            let close_error = format!("close picker pane {pane}: {error}");
+            if result.is_ok() {
+                result = Err(close_error);
+            } else {
+                eprintln!("herdr-muster: {close_error}");
+            }
+        }
     }
     result
 }
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("herdr-muster: {e}");
+    if let Err(error) = run() {
+        eprintln!("herdr-muster: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_refresh_never_clears_registry_bindings() {
+        let mut registry = Registry::default();
+        registry.bind(Path::new("/api"), "w1");
+
+        assert!(!reconcile_after_refresh(&mut registry, None));
+        assert_eq!(
+            registry
+                .workspace_for(Path::new("/api"))
+                .map(String::as_str),
+            Some("w1")
+        );
+    }
+
+    #[test]
+    fn successful_empty_refresh_reconciles_registry() {
+        let mut registry = Registry::default();
+        registry.bind(Path::new("/api"), "w1");
+
+        assert!(reconcile_after_refresh(
+            &mut registry,
+            Some(&HashSet::new())
+        ));
+        assert!(registry.workspace_for(Path::new("/api")).is_none());
     }
 }

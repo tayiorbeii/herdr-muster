@@ -47,7 +47,10 @@ Add this to your herdr `config.toml`, then run `herdr server reload-config`:
 
 ## Keys inside the switcher
 
-- Type to fuzzy filter, arrow keys to move.
+- Start typing immediately, even while workspaces and projects load. Fuzzy
+  filtering searches pane labels, terminal-title fallbacks, and full paths for
+  open workspaces; open workspaces stay above projects. Arrow keys move the
+  selection.
 - Enter jumps to the project. If it's open it focuses that workspace, otherwise
   it musters a new one.
 - Ctrl-N forces a brand new workspace for the selected directory.
