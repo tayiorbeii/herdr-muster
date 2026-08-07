@@ -25,6 +25,8 @@ pub struct Session {
     pub outcome: Outcome,
     pub live_workspace_ids: Option<HashSet<String>>,
     pub state: PickerState,
+    /// Workspace the picker was opened from, when it could be identified.
+    pub origin_workspace: Option<String>,
 }
 
 // --- tokyo-night palette ---
@@ -511,6 +513,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
     let mut loading = true;
     let mut refresh_error: Option<String> = None;
     let mut live_workspace_ids = None;
+    let mut origin_workspace = None;
     let mut channel_open = true;
     let mut outcome = Outcome::Cancel;
 
@@ -519,13 +522,15 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
             while channel_open {
                 match updates.try_recv() {
                     Ok(RefreshMessage::Partial(snapshot)) => {
-                        live_workspace_ids = Some(snapshot.live_workspace_ids.clone());
+                        live_workspace_ids = snapshot.live_workspace_ids.clone();
+                        origin_workspace = snapshot.origin_workspace.clone();
                         state.apply_partial(snapshot, &mut matcher);
                         loading = true;
                         refresh_error = None;
                     }
                     Ok(RefreshMessage::Ready(snapshot)) => {
-                        live_workspace_ids = Some(snapshot.live_workspace_ids.clone());
+                        live_workspace_ids = snapshot.live_workspace_ids.clone();
+                        origin_workspace = snapshot.origin_workspace.clone();
                         state.apply_snapshot(snapshot, &mut matcher);
                         loading = false;
                         refresh_error = None;
@@ -712,6 +717,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
             outcome,
             live_workspace_ids,
             state,
+            origin_workspace,
         })
     })();
     match terminal_guard.restore() {
@@ -816,7 +822,8 @@ mod tests {
                 open("two", "~/two", "/two", &[]),
                 open("one", "~/one", "/one", &[]),
             ],
-            live_workspace_ids: HashSet::new(),
+            live_workspace_ids: Some(HashSet::new()),
+            origin_workspace: None,
         };
 
         state.apply_snapshot(snapshot, &mut matcher);
@@ -843,7 +850,8 @@ mod tests {
         state.apply_partial(
             Snapshot {
                 rows: vec![open("open", "~/open", "/open", &[])],
-                live_workspace_ids: HashSet::from(["open".into()]),
+                live_workspace_ids: Some(HashSet::from(["open".into()])),
+                origin_workspace: None,
             },
             &mut matcher,
         );

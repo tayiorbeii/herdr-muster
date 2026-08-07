@@ -30,13 +30,13 @@ fn create_and_bind<H: Herdr>(
     herdr: &H,
     registry: &mut Registry,
     directory: &Path,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let cwd = directory.to_string_lossy().to_string();
     let id = herdr
         .create_workspace(&cwd, &sources::basename(directory))
         .map_err(|error| error.to_string())?;
     registry.bind(directory, &id);
-    Ok(())
+    Ok(id)
 }
 
 fn reconcile_after_refresh(
@@ -51,42 +51,60 @@ fn run() -> Result<(), String> {
     let client = herdr::CliHerdr::new(bin);
     let config_path = config_path();
     let registry_path = state_path();
+    let origin_pane = std::env::var("HERDR_PANE_ID").ok();
     let mut registry = Registry::load(&registry_path);
     let mut dirty = false;
     let mut previous_state = picker::PickerState::default();
 
     let mut result = (|| -> Result<(), String> {
         loop {
-            let updates = refresh::spawn(client.clone(), config_path.clone(), registry.live_map());
+            let updates = refresh::spawn(
+                client.clone(),
+                config_path.clone(),
+                registry.live_map(),
+                registry.mru().to_vec(),
+                origin_pane.clone(),
+            );
             let session = picker::run(std::mem::take(&mut previous_state), updates)
                 .map_err(|error| error.to_string())?;
             let picker::Session {
                 outcome,
                 live_workspace_ids,
                 mut state,
+                origin_workspace,
             } = session;
 
             if reconcile_after_refresh(&mut registry, live_workspace_ids.as_ref()) {
                 dirty = true;
+            }
+            // The workspace the picker was opened from is the most recently
+            // used one by definition, so Enter fast-tracks back to it.
+            if let Some(origin) = origin_workspace {
+                dirty |= registry.touch(&origin);
             }
 
             match outcome {
                 picker::Outcome::Cancel => return Ok(()),
                 picker::Outcome::Jump(row) => {
                     match &row.kind {
-                        Kind::Open { workspace_id, .. } => client
-                            .focus_workspace(workspace_id)
-                            .map_err(|error| error.to_string())?,
+                        Kind::Open { workspace_id, .. } => {
+                            client
+                                .focus_workspace(workspace_id)
+                                .map_err(|error| error.to_string())?;
+                            dirty |= registry.touch(workspace_id);
+                        }
                         Kind::Dormant => {
-                            create_and_bind(&client, &mut registry, &row.path)?;
+                            let id = create_and_bind(&client, &mut registry, &row.path)?;
                             dirty = true;
+                            registry.touch(&id);
                         }
                     }
                     return Ok(());
                 }
                 picker::Outcome::ForceNew(row) => {
-                    create_and_bind(&client, &mut registry, &row.path)?;
+                    let id = create_and_bind(&client, &mut registry, &row.path)?;
                     dirty = true;
+                    registry.touch(&id);
                     return Ok(());
                 }
                 picker::Outcome::Close(row) => {
@@ -95,8 +113,8 @@ fn run() -> Result<(), String> {
                         client
                             .close_workspace(workspace_id)
                             .map_err(|error| error.to_string())?;
-                        registry.unbind(&row.path);
-                        dirty = true;
+                        dirty |= registry.unbind_if_bound(&row.path, workspace_id);
+                        dirty |= registry.forget(workspace_id);
                     }
                     state.remove(&closed_id);
                     previous_state = state;

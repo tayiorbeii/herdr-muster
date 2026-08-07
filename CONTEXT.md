@@ -26,6 +26,11 @@ Glossary for the `muster` plugin. Definitions only — no implementation detail.
 - **Muster** (verb) — to jump to a project: focus its workspace if open, else
   create one and enter it. Named for the livestock-roundup sense of the word.
 
+- **Recency** — the picker's ordering for its *open* group: the workspace the
+  picker was opened from, then previously used workspaces, most recent first.
+  Enter on the top row fast-tracks back to where you were; Down+Enter reaches
+  the one before that.
+
 - **Identity** — the fixed association between a project and its workspace.
   Assigned when muster creates the workspace, so a pane later moved to another
   directory still belongs to its original project. Stored in a muster-owned

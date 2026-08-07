@@ -107,6 +107,8 @@ pub fn assemble(
     workspaces: &[Workspace],
     panes: &[Pane],
     dormant: &[Candidate],
+    mru: &[String],
+    origin_workspace: Option<&str>,
 ) -> Vec<Row> {
     let workspace_bindings: HashMap<&str, &Path> = bound
         .iter()
@@ -183,14 +185,27 @@ pub fn assemble(
         });
     }
 
-    rows.sort_by_key(sort_key);
+    rows.sort_by_key(|row| sort_key(row, mru, origin_workspace));
     rows
 }
 
-fn sort_key(row: &Row) -> (u8, u8, String) {
+fn sort_key(row: &Row, mru: &[String], origin_workspace: Option<&str>) -> (u8, usize, u8, String) {
     match &row.kind {
-        Kind::Open { state, .. } => (0, state.rank(), row.name.to_lowercase()),
-        Kind::Dormant => (1, 0, row.name.to_lowercase()),
+        Kind::Open { workspace_id, state, .. } => {
+            // Open workspaces rank by recency: the workspace the picker was
+            // opened from first, then the persisted most-recently-used order.
+            // Workspaces never focused through muster fall back to agent-state
+            // priority, then name.
+            let position = if Some(workspace_id.as_str()) == origin_workspace {
+                0
+            } else {
+                mru.iter()
+                    .position(|id| id == workspace_id)
+                    .map_or(usize::MAX, |index| index + 1)
+            };
+            (0, position, state.rank(), row.name.to_lowercase())
+        }
+        Kind::Dormant => (1, 0, 0, row.name.to_lowercase()),
     }
 }
 
@@ -260,7 +275,7 @@ mod tests {
             candidate("/dev/alpha"),
         ];
 
-        let rows = assemble(&bound, &workspaces, &panes, &dormant);
+        let rows = assemble(&bound, &workspaces, &panes, &dormant, &[], None);
 
         assert_eq!(rows[0].name, "api");
         assert!(matches!(
@@ -284,6 +299,43 @@ mod tests {
     }
 
     #[test]
+    fn open_rows_rank_by_most_recently_used_with_origin_first() {
+        let mut bound = HashMap::new();
+        bound.insert(PathBuf::from("/dev/web"), "w1".to_string());
+        bound.insert(PathBuf::from("/dev/api"), "w2".to_string());
+        bound.insert(PathBuf::from("/dev/other"), "w3".to_string());
+        let workspaces = vec![
+            workspace("w1", "web", "working"),
+            workspace("w2", "api", "blocked"),
+            workspace("w3", "other", "idle"),
+        ];
+        let panes = vec![
+            pane("w1:p1", "w1", Some("/dev/web"), None),
+            pane("w2:p1", "w2", Some("/dev/api"), None),
+            pane("w3:p1", "w3", Some("/dev/other"), None),
+        ];
+        let dormant = vec![candidate("/dev/zeta")];
+        let mru = vec!["w3".to_string(), "w1".to_string()];
+
+        // The workspace the picker was opened from wins, even over a blocked
+        // workspace and the previous MRU front.
+        let rows = assemble(&bound, &workspaces, &panes, &dormant, &mru, Some("w2"));
+        assert_eq!(rows[0].name, "api");
+        assert_eq!(rows[1].name, "other");
+        assert_eq!(rows[2].name, "web");
+        assert_eq!(rows[3].name, "zeta");
+        assert_eq!(rows.len(), 4);
+
+        // Without an origin, persisted MRU order applies; never-focused
+        // workspaces sort after it by agent-state priority.
+        let rows = assemble(&bound, &workspaces, &panes, &dormant, &mru, None);
+        assert_eq!(rows[0].name, "other");
+        assert_eq!(rows[1].name, "web");
+        assert_eq!(rows[2].name, "api");
+        assert_eq!(rows[3].name, "zeta");
+    }
+
+    #[test]
     fn alphabetic_pane_numbers_select_the_lowest_root() {
         let workspaces = vec![workspace("wJ", "workspace", "idle")];
         let panes = vec![
@@ -291,7 +343,7 @@ mod tests {
             pane("wJ:pJ", "wJ", Some("/right"), Some("claude")),
         ];
 
-        let rows = assemble(&HashMap::new(), &workspaces, &panes, &[]);
+        let rows = assemble(&HashMap::new(), &workspaces, &panes, &[], &[], None);
 
         assert_eq!(rows[0].path, PathBuf::from("/right"));
         assert!(matches!(
@@ -308,10 +360,23 @@ mod tests {
             pane("w1:p!", "w1", None, None),
         ];
 
-        let rows = assemble(&HashMap::new(), &workspaces, &panes, &[]);
+        let rows = assemble(&HashMap::new(), &workspaces, &panes, &[], &[], None);
 
         assert_eq!(rows[0].name, "fallback");
         assert_eq!(rows[0].path, PathBuf::from("fallback"));
+    }
+
+    #[test]
+    fn missing_cwd_uses_a_sanitized_workspace_label() {
+        let workspaces = crate::herdr::parse_workspaces(
+            r#"{"result":{"workspaces":[{"workspace_id":"w1","label":"\u001b[2Jfallback","agent_status":"idle"}]}}"#,
+        )
+        .unwrap();
+
+        let rows = assemble(&HashMap::new(), &workspaces, &[], &[], &[], None);
+
+        assert_eq!(rows[0].name, "[2Jfallback");
+        assert_eq!(rows[0].display, "[2Jfallback");
     }
 
     #[test]

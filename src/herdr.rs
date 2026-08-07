@@ -1,8 +1,8 @@
 use serde::Deserialize;
 use std::fmt;
-use std::io::Read;
+use std::io::{self, Read};
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::os::unix::{io::AsRawFd, process::CommandExt};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -179,7 +179,10 @@ pub fn parse_workspaces(json: &str) -> Result<Vec<Workspace>> {
         .into_iter()
         .map(|workspace| Workspace {
             workspace_id: workspace.workspace_id,
-            label: workspace.label,
+            // Workspace labels are rendered as a fallback when no directory is
+            // available, so apply the same terminal-control filtering as pane
+            // names before they reach Ratatui.
+            label: clean(Some(workspace.label)).unwrap_or_default(),
             agent_status: if workspace.agent_status.is_empty() {
                 "unknown".into()
             } else {
@@ -217,7 +220,7 @@ pub fn parse_panes(json: &str) -> Result<Vec<Pane>> {
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_POLL: Duration = Duration::from_millis(20);
 const PROCESS_GROUP_GRACE: Duration = Duration::from_millis(50);
-const READER_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_COMMAND_OUTPUT: usize = 8 * 1024 * 1024;
 
 /// Stop a command and every descendant that inherited its process group. This
 /// also closes pipes held by backgrounded descendants so output readers finish.
@@ -244,6 +247,37 @@ fn stop_command(child: &mut Child) {
     let _ = child.wait();
 }
 
+#[cfg(unix)]
+fn set_nonblocking(stream: &impl AsRawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn drain_available(stream: &mut impl Read, output: &mut Vec<u8>) -> io::Result<()> {
+    let mut buffer = [0; 8192];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(count) => {
+                if output.len().saturating_add(count) > MAX_COMMAND_OUTPUT {
+                    return Err(io::Error::other("command output exceeds 8 MiB limit"));
+                }
+                output.extend_from_slice(&buffer[..count]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 pub(crate) fn command_output(
     command: &mut Command,
     label: &str,
@@ -258,7 +292,7 @@ pub(crate) fn command_output(
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {
-                Err(std::io::Error::last_os_error())
+                Err(io::Error::last_os_error())
             } else {
                 Ok(())
             }
@@ -267,88 +301,83 @@ pub(crate) fn command_output(
     let mut child = command
         .spawn()
         .map_err(|error| HerdrError::Spawn(format!("spawn {label}: {error}")))?;
-    let stdout = child.stdout.take().expect("stdout configured as piped");
-    let stderr = child.stderr.take().expect("stderr configured as piped");
-    let (stdout_sender, stdout_receiver) = std::sync::mpsc::sync_channel(1);
-    let stdout_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut stdout = stdout;
-        let _ = stdout_sender.send(stdout.read_to_end(&mut bytes).map(|_| bytes));
-    });
-    let (stderr_sender, stderr_receiver) = std::sync::mpsc::sync_channel(1);
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut stderr = stderr;
-        let _ = stderr_sender.send(stderr.read_to_end(&mut bytes).map(|_| bytes));
-    });
-    let started = Instant::now();
+    let mut stdout = child.stdout.take().expect("stdout configured as piped");
+    let mut stderr = child.stderr.take().expect("stderr configured as piped");
 
+    #[cfg(unix)]
+    {
+        set_nonblocking(&stdout)
+            .and_then(|()| set_nonblocking(&stderr))
+            .map_err(|error| {
+                stop_command(&mut child);
+                HerdrError::Spawn(format!("configure {label} output: {error}"))
+            })?;
+    }
+
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let started = Instant::now();
     let status = loop {
         if cancellation.is_some_and(|token| token.load(Ordering::Relaxed)) {
             stop_command(&mut child);
-            break Err(HerdrError::Cancelled(format!("{label} cancelled")));
+            return Err(HerdrError::Cancelled(format!("{label} cancelled")));
         }
         if started.elapsed() >= COMMAND_TIMEOUT {
             stop_command(&mut child);
-            break Err(HerdrError::Timeout(format!(
+            return Err(HerdrError::Timeout(format!(
                 "{label} timed out after {} seconds",
                 COMMAND_TIMEOUT.as_secs()
             )));
         }
+
+        #[cfg(unix)]
+        if let Err(error) = drain_available(&mut stdout, &mut stdout_bytes)
+            .and_then(|()| drain_available(&mut stderr, &mut stderr_bytes))
+        {
+            stop_command(&mut child);
+            return Err(HerdrError::Spawn(format!("read {label} output: {error}")));
+        }
+
         match child.try_wait() {
             Ok(Some(status)) => {
                 // A shell may exit successfully after placing work in the
-                // background. Stop descendants before reader joins, since they
-                // may otherwise retain stdout/stderr indefinitely.
+                // background. Stop descendants before returning, then retain
+                // only output already available from our pipe ends. An escaped
+                // descendant can keep its inherited ends open forever, but it
+                // can no longer block this command or retain a reader thread.
                 stop_command(&mut child);
-                break Ok(status);
+                #[cfg(unix)]
+                if let Err(error) = drain_available(&mut stdout, &mut stdout_bytes)
+                    .and_then(|()| drain_available(&mut stderr, &mut stderr_bytes))
+                {
+                    return Err(HerdrError::Spawn(format!("read {label} output: {error}")));
+                }
+                break status;
             }
             Ok(None) => thread::sleep(COMMAND_POLL),
             Err(error) => {
                 stop_command(&mut child);
-                break Err(HerdrError::Spawn(format!("wait for {label}: {error}")));
+                return Err(HerdrError::Spawn(format!("wait for {label}: {error}")));
             }
         }
     };
 
-    // A descendant can escape the process group with setsid() while retaining
-    // these pipe ends. Do not let that make cancellation or timeout teardown
-    // wait forever: readers get one shared bounded grace period, after which
-    // dropping their JoinHandles deliberately detaches them.
-    let reader_deadline = Instant::now() + READER_COMPLETION_TIMEOUT;
-    let receive_reader = |receiver: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>, stream| {
-        let remaining = reader_deadline.saturating_duration_since(Instant::now());
-        receiver
-            .recv_timeout(remaining)
-            .map_err(|error| match error {
-                std::sync::mpsc::RecvTimeoutError::Timeout => HerdrError::Spawn(format!(
-                    "read {label} {stream}: reader did not finish after process teardown"
-                )),
-                std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                    HerdrError::Spawn(format!("read {label} {stream}: reader disconnected"))
-                }
-            })?
-            .map_err(|error| HerdrError::Spawn(format!("read {label} {stream}: {error}")))
-    };
-    let stdout = receive_reader(stdout_receiver, "stdout");
-    let stderr = receive_reader(stderr_receiver, "stderr");
+    #[cfg(not(unix))]
+    {
+        // Muster is supported only on Unix platforms, but retain a portable
+        // fallback for compilation on other hosts.
+        stdout
+            .read_to_end(&mut stdout_bytes)
+            .map_err(|error| HerdrError::Spawn(format!("read {label} stdout: {error}")))?;
+        stderr
+            .read_to_end(&mut stderr_bytes)
+            .map_err(|error| HerdrError::Spawn(format!("read {label} stderr: {error}")))?;
+    }
 
-    // Join only readers that have reported completion. Dropping a JoinHandle
-    // detaches a blocked reader, whose pipe will close when an escaped holder
-    // eventually exits.
-    if stdout.is_ok() {
-        let _ = stdout_reader.join();
-    }
-    if stderr.is_ok() {
-        let _ = stderr_reader.join();
-    }
-    let stdout = stdout?;
-    let stderr = stderr?;
-    let status = status?;
     Ok(Output {
         status,
-        stdout,
-        stderr,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
     })
 }
 
@@ -439,6 +468,14 @@ mod tests {
     }
 
     #[test]
+    fn removes_terminal_control_characters_from_workspace_labels() {
+        let json = r#"{"result":{"workspaces":[{"workspace_id":"w1","label":" \u001b[2J dashboard\u009bK ","agent_status":"idle"}]}}"#;
+        let workspaces = parse_workspaces(json).unwrap();
+
+        assert_eq!(workspaces[0].label, "[2J dashboardK");
+    }
+
+    #[test]
     fn parses_created_id() {
         assert_eq!(parse_created_id(CR).unwrap(), "w9");
     }
@@ -521,7 +558,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn cancellation_returns_when_setsid_descendant_holds_output_pipes() {
+    fn cancellation_returns_promptly_when_setsid_descendant_streams_output() {
         struct EscapedProcess(Option<i32>);
 
         impl Drop for EscapedProcess {
@@ -551,7 +588,10 @@ mod tests {
                 let mut command = Command::new("python3");
                 command.args([
                     "-c",
-                    "import os, sys, time\npid = os.fork()\nif pid:\n    os.waitpid(pid, 0)\nelse:\n    os.setsid()\n    tmp = sys.argv[1] + '.tmp'\n    open(tmp, 'w').write(str(os.getpid()))\n    os.rename(tmp, sys.argv[1])\n    time.sleep(5)",
+                    "import os, sys, time\npid = os.fork()\nif pid:\n    os.waitpid(pid, 0)\nelse:\n    os.setsid()\n    tmp = sys.argv[1] + '.tmp'\n    open(tmp, 'w').write(str(os.getpid()))\n    os.rename(tmp, sys.argv[1])\n    while True:
+        sys.stdout.write('x' * 1024)
+        sys.stdout.flush()
+        time.sleep(0.01)",
                     pid_file.to_str().unwrap(),
                 ]);
                 command_output(
@@ -577,11 +617,25 @@ mod tests {
         let started = Instant::now();
         let error = worker.join().unwrap().unwrap_err();
 
-        assert!(
-            matches!(error, HerdrError::Spawn(message) if message.contains("reader did not finish"))
-        );
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(matches!(error, HerdrError::Cancelled(_)));
+        assert!(started.elapsed() < Duration::from_secs(1));
         drop(escaped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn excessive_command_output_is_bounded() {
+        let started = Instant::now();
+        let mut command = Command::new("python3");
+        command.args([
+            "-c",
+            "import sys
+while True: sys.stdout.write('x' * 8192)",
+        ]);
+        let error = command_output(&mut command, "unbounded output", None).unwrap_err();
+
+        assert!(matches!(error, HerdrError::Spawn(message) if message.contains("8 MiB limit")));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[cfg(unix)]
