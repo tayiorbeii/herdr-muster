@@ -1057,7 +1057,10 @@ mod tests {
 
         // Numbers skip dormant rows: 0 -> first open, 1 -> second open, etc.
         // `selected` tracks the filtered position of the found row.
-        assert_eq!(nth_open_jump(&mut state, &filtered, 0).unwrap().name, "three");
+        assert_eq!(
+            nth_open_jump(&mut state, &filtered, 0).unwrap().name,
+            "three"
+        );
         assert_eq!(state.selected, 0);
         assert_eq!(nth_open_jump(&mut state, &filtered, 1).unwrap().name, "two");
         assert_eq!(state.selected, 1);

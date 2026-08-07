@@ -366,8 +366,7 @@ esac
             match updates.try_recv() {
                 Ok(Message::Ready(ready)) => {
                     assert_eq!(ready.origin_workspace.as_deref(), Some("w2"));
-                    let names: Vec<_> =
-                        ready.rows.iter().map(|row| row.name.as_str()).collect();
+                    let names: Vec<_> = ready.rows.iter().map(|row| row.name.as_str()).collect();
                     assert_eq!(names, vec!["web", "api"]);
                     break;
                 }

@@ -95,6 +95,19 @@ fn canon(dir: &str) -> PathBuf {
     std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir))
 }
 
+/// Control-stripped basename for display. Directory names reach Ratatui raw,
+/// so remove terminal control characters before rendering; a pathological
+/// control-char-only name falls back to a printable placeholder while the
+/// path itself stays untouched for identity and workspace creation.
+fn display_name_for(path: &Path) -> String {
+    let name = crate::herdr::sanitize_text(&basename(path));
+    if name.trim().is_empty() {
+        "project".to_string()
+    } else {
+        name
+    }
+}
+
 fn root_key(pane: &Pane) -> (usize, &str) {
     (pane.number().unwrap_or(usize::MAX), pane.pane_id.as_str())
 }
@@ -148,7 +161,11 @@ pub fn assemble(
         let state = AgentState::from_str(&workspace.agent_status);
 
         let (name, display, path) = match directory {
-            Some(directory) => (basename(&directory), collapse_home(&directory), directory),
+            Some(directory) => (
+                display_name_for(&directory),
+                crate::herdr::sanitize_text(&collapse_home(&directory)),
+                directory,
+            ),
             None => {
                 let fallback = if workspace.label.trim().is_empty() {
                     workspace.workspace_id.clone()
@@ -177,7 +194,7 @@ pub fn assemble(
             continue;
         }
         rows.push(Row {
-            name: basename(&candidate.path),
+            name: display_name_for(&candidate.path),
             display: candidate.display.clone(),
             path: candidate.path.clone(),
             pane_names: Vec::new(),
@@ -191,7 +208,11 @@ pub fn assemble(
 
 fn sort_key(row: &Row, mru: &[String], origin_workspace: Option<&str>) -> (u8, usize, u8, String) {
     match &row.kind {
-        Kind::Open { workspace_id, state, .. } => {
+        Kind::Open {
+            workspace_id,
+            state,
+            ..
+        } => {
             // Open workspaces rank by recency: the workspace the picker was
             // opened from first, then the persisted most-recently-used order.
             // Workspaces never focused through muster fall back to agent-state

@@ -136,17 +136,25 @@ struct CrWs {
     workspace_id: String,
 }
 
+/// Remove terminal control characters (C0, DEL, C1) from text that the picker
+/// will render, so pane titles, labels, and paths cannot inject escape
+/// sequences into the terminal. Used for display-only strings; identity and
+/// command arguments always keep the original value.
+pub(crate) fn sanitize_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| {
+            !matches!(character, '\u{0000}'..='\u{001f}' | '\u{007f}' | '\u{0080}'..='\u{009f}')
+        })
+        .collect()
+}
+
 fn clean(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         // Herdr titles originate in terminal-controlled state. Remove every
         // terminal control range before trimming so pane text cannot inject
         // escape sequences into the picker.
-        let sanitized: String = value
-            .chars()
-            .filter(|character| {
-                !matches!(character, '\u{0000}'..='\u{001f}' | '\u{007f}' | '\u{0080}'..='\u{009f}')
-            })
-            .collect();
+        let sanitized = sanitize_text(&value);
         let trimmed = sanitized.trim();
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     })

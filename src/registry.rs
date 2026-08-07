@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Registry {
-    map: HashMap<String, String>,
+    /// Directory -> workspace bindings. A `BTreeMap` keeps the serialized state
+    /// file deterministic (stable key order across saves, clean diffs).
+    map: BTreeMap<String, String>,
     /// Workspace ids ordered most-recently-focused first. The picker ranks its
     /// open group by this list, so Enter fast-tracks back to the workspace the
     /// picker was opened from and Down+Enter reaches the one before it.
@@ -25,7 +27,19 @@ fn key(directory: &Path) -> String {
 impl Registry {
     pub fn load(path: &Path) -> Registry {
         let registry: Registry = match fs::read_to_string(path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+            Ok(text) => match serde_json::from_str(&text) {
+                Ok(registry) => registry,
+                Err(error) => {
+                    // A corrupt state file silently resets every project
+                    // identity and the recency order. Say so instead of
+                    // dropping the data without a trace.
+                    eprintln!(
+                        "herdr-muster: state file {} is corrupt ({error}); starting fresh",
+                        path.display()
+                    );
+                    Registry::default()
+                }
+            },
             Err(_) => Registry::default(),
         };
 
@@ -49,7 +63,7 @@ impl Registry {
                 ))
             },
         );
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         for (directory, workspace) in entries {
             map.entry(key(Path::new(&directory))).or_insert(workspace);
         }

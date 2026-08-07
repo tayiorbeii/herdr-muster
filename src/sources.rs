@@ -100,7 +100,11 @@ fn finalize(raw: Vec<PathBuf>, cancellation: &AtomicBool) -> Option<Vec<Candidat
         }
         if seen.insert(canon.clone()) {
             out.push(Candidate {
-                display: collapse_home(&canon),
+                // Display strings reach Ratatui raw, so strip terminal control
+                // characters from directory names (a hostile checkout or
+                // zoxide entry must not be able to inject escape sequences).
+                // The path itself is preserved untouched for identity.
+                display: crate::herdr::sanitize_text(&collapse_home(&canon)),
                 path: canon,
             });
         }
@@ -278,5 +282,27 @@ mod tests {
         let home = dirs::home_dir().unwrap();
         assert_eq!(basename(Path::new("/x/y/proj")), "proj");
         assert_eq!(collapse_home(&home.join("dev")), "~/dev");
+    }
+
+    #[test]
+    fn gather_sanitizes_display_but_keeps_the_real_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("api\u{1b}[2J");
+        fs::create_dir_all(&dir).unwrap();
+        let cfg = Config {
+            paths: vec![dir.to_string_lossy().to_string()],
+            roots: vec![],
+            use_zoxide: false,
+        };
+        let cancellation = AtomicBool::new(false);
+        let got = gather(&cfg, &[], &cancellation).unwrap();
+
+        assert_eq!(got.len(), 1);
+        assert!(
+            !got[0].display.contains('\u{1b}'),
+            "display escaped: {:?}",
+            got[0].display
+        );
+        assert_eq!(got[0].path, fs::canonicalize(&dir).unwrap());
     }
 }
