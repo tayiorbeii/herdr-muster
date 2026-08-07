@@ -57,6 +57,10 @@ Add this to your herdr `config.toml`, then run `herdr server reload-config`:
   most-recently-used first, so Enter on the top row fast-tracks you back to
   where you were, and Down+Enter goes to the one before that. If the project
   isn't open yet, Enter musters a fresh workspace for it.
+- Hold Alt and press a number to jump straight to the matching open
+  workspace: Alt+0 is the workspace you opened the switcher from, Alt+1 the
+  one before that, and so on through Alt+9. Open rows show their number up
+  front (0–9), so the shortcut is always visible.
 - Ctrl-N forces a brand new workspace for the selected directory.
 - Ctrl-X closes the selected open workspace.
 - Esc or Ctrl-C backs out.

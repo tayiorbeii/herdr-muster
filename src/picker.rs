@@ -157,6 +157,50 @@ impl PickerState {
     }
 }
 
+/// Map an Alt+digit key to a row index, where 0 is the most recently used
+/// open workspace and 9 the tenth. Returns `None` for non-digit keys.
+fn alt_digit_index(digit: char) -> Option<usize> {
+    digit.to_digit(10).map(|digit| digit as usize)
+}
+
+/// macOS US-layout Option+0..9 glyphs, for terminals that send the symbol
+/// instead of an ESC-prefixed digit (Option-as-Meta disabled).
+const MAC_OPTION_DIGITS: &[(char, char)] = &[
+    ('º', '0'),
+    ('¡', '1'),
+    ('™', '2'),
+    ('£', '3'),
+    ('¢', '4'),
+    ('∞', '5'),
+    ('§', '6'),
+    ('¶', '7'),
+    ('•', '8'),
+    ('ª', '9'),
+];
+
+/// Map a macOS Option+digit glyph to a row index, when the terminal sent the
+/// symbol rather than an ESC-prefixed digit.
+fn mac_option_digit(character: char) -> Option<usize> {
+    MAC_OPTION_DIGITS
+        .iter()
+        .find(|(symbol, _)| *symbol == character)
+        .and_then(|(_, digit)| digit.to_digit(10).map(|digit| digit as usize))
+}
+
+/// Select and return the row of the Nth open workspace in the filtered list,
+/// matching the quick-jump number shown in front of open rows. `None` when
+/// fewer than N+1 open rows match. Dormant rows are skipped.
+fn nth_open_jump(state: &mut PickerState, filtered: &[usize], n: usize) -> Option<Row> {
+    let position = filtered
+        .iter()
+        .enumerate()
+        .filter(|(_, &row_index)| matches!(state.rows[row_index].kind, Kind::Open { .. }))
+        .nth(n)
+        .map(|(position, _)| position)?;
+    state.selected = position;
+    state.selected_row(filtered)
+}
+
 fn state_color(state: AgentState) -> Color {
     match state {
         AgentState::Blocked => RED,
@@ -338,18 +382,22 @@ fn body_spans(
     ]
 }
 
-/// One row constrained to `width` terminal display columns.
-fn row_line(row: &Row, width: usize) -> Line<'static> {
+/// One row constrained to `width` terminal display columns. `number` is the
+/// Alt+digit quick-jump index shown in front of open rows; dormant rows pass
+/// `None`.
+fn row_line(row: &Row, width: usize, number: Option<usize>) -> Line<'static> {
     if width == 0 {
         return Line::default();
     }
 
     match &row.kind {
         Kind::Open { state, agent, .. } => {
+            let number_prefix = number.map_or(String::new(), |digit| format!("{digit} "));
+            let number_width = display_width(&number_prefix);
             let color = state_color(*state);
             let glyph = truncate_to_width(&format!("{} ", state.glyph()), width.min(GLYPH_W));
             let glyph_width = display_width(&glyph);
-            let remaining = width.saturating_sub(glyph_width);
+            let remaining = width.saturating_sub(number_width + glyph_width);
 
             let full_meta = match agent {
                 Some(agent) => format!("{agent} · {}", state.word()),
@@ -375,7 +423,14 @@ fn row_line(row: &Row, width: usize) -> Line<'static> {
                 body.push(Span::raw(" ".repeat(body_budget - body_width)));
             }
 
-            let mut spans = vec![Span::styled(glyph, Style::default().fg(color))];
+            let mut spans = Vec::new();
+            if !number_prefix.is_empty() {
+                spans.push(Span::styled(
+                    number_prefix,
+                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.push(Span::styled(glyph, Style::default().fg(color)));
             spans.extend(body);
             if meta_gap > 0 {
                 spans.push(Span::raw(" "));
@@ -421,6 +476,7 @@ fn build(
     let mut items = Vec::new();
     let mut selected_position = 0;
     let mut last_group = None;
+    let mut open_index = 0usize;
     for (filtered_index, row_index) in filtered.iter().copied().enumerate() {
         let row = &rows[row_index];
         let group = if matches!(row.kind, Kind::Open { .. }) {
@@ -443,7 +499,15 @@ fn build(
         if filtered_index == selected {
             selected_position = items.len();
         }
-        items.push(ListItem::new(row_line(row, width)));
+        // Open rows carry their Alt+digit quick-jump number (0-9) up front.
+        let number = if group == 0 {
+            let number = open_index;
+            open_index += 1;
+            (number <= 9).then_some(number)
+        } else {
+            None
+        };
+        items.push(ListItem::new(row_line(row, width, number)));
     }
     (items, selected_position)
 }
@@ -651,7 +715,8 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                 frame.render_stateful_widget(list, vertical[2], &mut list_state);
 
                 let mut footer = Vec::new();
-                footer.extend(keycap("↵", "jump / create"));
+                footer.extend(keycap("↵", "jump/create"));
+                footer.extend(keycap("⌥0-9", "recents"));
                 footer.extend(keycap("^n", "force new"));
                 footer.extend(keycap("^x", "close"));
                 footer.extend(keycap("esc", "cancel"));
@@ -672,6 +737,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
             }
 
             let control = key.modifiers.contains(KeyModifiers::CONTROL);
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
             match key.code {
                 KeyCode::Esc => break,
                 KeyCode::Char('c') if control => break,
@@ -679,6 +745,16 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                     if let Some(row) = state.selected_row(&filtered) {
                         outcome = Outcome::Jump(row);
                         break;
+                    }
+                }
+                // Alt+0..9 jumps to the Nth open workspace: 0 is the workspace
+                // the picker was opened from, 1 the one before that, etc.
+                KeyCode::Char(digit) if alt => {
+                    if let Some(index) = alt_digit_index(digit) {
+                        if let Some(row) = nth_open_jump(&mut state, &filtered, index) {
+                            outcome = Outcome::Jump(row);
+                            break;
+                        }
                     }
                 }
                 KeyCode::Char('n') if control => {
@@ -706,6 +782,14 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                     state.selected = 0;
                 }
                 KeyCode::Char(character) if !control => {
+                    // Some macOS terminals send the Option glyph (º¡™…) rather
+                    // than ESC+digit; treat those as quick jumps too.
+                    if let Some(index) = mac_option_digit(character) {
+                        if let Some(row) = nth_open_jump(&mut state, &filtered, index) {
+                            outcome = Outcome::Jump(row);
+                            break;
+                        }
+                    }
                     state.query.push(character);
                     state.selected = 0;
                 }
@@ -876,14 +960,47 @@ mod tests {
 
         for width in 0..80 {
             assert!(
-                row_line(&open_row, width).width() <= width,
+                row_line(&open_row, width, Some(9)).width() <= width,
                 "open width {width}"
             );
             assert!(
-                row_line(&project_row, width).width() <= width,
+                row_line(&open_row, width, None).width() <= width,
+                "open without number width {width}"
+            );
+            assert!(
+                row_line(&project_row, width, None).width() <= width,
                 "project width {width}"
             );
         }
+    }
+
+    #[test]
+    fn open_rows_show_their_quick_jump_number() {
+        let rows = vec![
+            open("api", "~/api", "/api", &[]),
+            project("dormant", "~/dormant", "/dormant"),
+            open("web", "~/web", "/web", &[]),
+        ];
+        let state = PickerState {
+            rows,
+            query: String::new(),
+            selected: 0,
+        };
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+        let filtered = state.filtered(&mut matcher);
+        assert_eq!(filtered, vec![0, 2, 1]);
+
+        // Open rows are numbered 0.. by their position among open matches;
+        // dormant rows get no number.
+        let first = row_line(&state.rows[filtered[0]], 60, Some(0)).to_string();
+        assert!(first.contains("0 "), "{first:?}");
+        assert!(first.contains("api"));
+        let second = row_line(&state.rows[filtered[1]], 60, Some(1)).to_string();
+        assert!(second.contains("1 "), "{second:?}");
+        assert!(second.contains("web"));
+        let dormant = row_line(&state.rows[filtered[2]], 60, None).to_string();
+        assert!(dormant.contains("dormant"));
+        assert!(!dormant.contains("0 "), "{dormant:?}");
     }
 
     #[test]
@@ -902,5 +1019,50 @@ mod tests {
             &["editor", "editor", "tests", "shell"],
         );
         assert_eq!(pane_label(&row), "editor · tests +1");
+    }
+
+    #[test]
+    fn alt_digit_maps_to_row_indexes() {
+        assert_eq!(alt_digit_index('0'), Some(0));
+        assert_eq!(alt_digit_index('1'), Some(1));
+        assert_eq!(alt_digit_index('9'), Some(9));
+        assert_eq!(alt_digit_index('a'), None);
+    }
+
+    #[test]
+    fn mac_option_glyphs_map_to_row_indexes() {
+        assert_eq!(mac_option_digit('º'), Some(0));
+        assert_eq!(mac_option_digit('™'), Some(2));
+        assert_eq!(mac_option_digit('∞'), Some(5));
+        assert_eq!(mac_option_digit('ª'), Some(9));
+        assert_eq!(mac_option_digit('x'), None);
+    }
+
+    #[test]
+    fn nth_open_jump_skips_dormant_rows_and_selects() {
+        let mut state = PickerState {
+            rows: vec![
+                open("three", "~/three", "/three", &[]),
+                project("dormant", "~/dormant", "/dormant"),
+                open("two", "~/two", "/two", &[]),
+                project("dormant2", "~/dormant2", "/dormant2"),
+                open("one", "~/one", "/one", &[]),
+            ],
+            query: String::new(),
+            selected: 0,
+        };
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+        let filtered = state.filtered(&mut matcher);
+        assert_eq!(filtered, vec![0, 2, 4, 1, 3]);
+
+        // Numbers skip dormant rows: 0 -> first open, 1 -> second open, etc.
+        // `selected` tracks the filtered position of the found row.
+        assert_eq!(nth_open_jump(&mut state, &filtered, 0).unwrap().name, "three");
+        assert_eq!(state.selected, 0);
+        assert_eq!(nth_open_jump(&mut state, &filtered, 1).unwrap().name, "two");
+        assert_eq!(state.selected, 1);
+        assert_eq!(nth_open_jump(&mut state, &filtered, 2).unwrap().name, "one");
+        assert_eq!(state.selected, 2);
+        assert!(nth_open_jump(&mut state, &filtered, 99).is_none());
     }
 }
