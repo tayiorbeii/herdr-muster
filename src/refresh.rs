@@ -51,7 +51,8 @@ pub struct Snapshot {
     /// persisted bindings against this incomplete snapshot.
     pub live_workspace_ids: Option<HashSet<String>>,
     /// The workspace the picker pane was opened from, when identifiable. The
-    /// picker ranks it first so Enter fast-tracks back to where you were.
+    /// picker ranks it last so Enter fast-tracks to where you were before it;
+    /// Escape returns to it.
     pub origin_workspace: Option<String>,
 }
 
@@ -324,7 +325,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn spawn_orders_open_rows_by_recency_with_origin_first() {
+    fn spawn_orders_open_rows_by_recency_with_origin_last() {
         use std::fs;
 
         let directory = tempfile::tempdir().unwrap();
@@ -350,8 +351,9 @@ esac
         }
 
         let client = CliHerdr::new(fake.to_string_lossy().into_owned());
-        // w1 was the most recent before this picker opened, but the picker
-        // pane (HERDR_PANE_ID) lives in w2, so w2 must rank first.
+        // w1 was the most recent before this picker opened, so it leads and
+        // Enter fast-tracks back to it; the picker pane (HERDR_PANE_ID)
+        // lives in w2, so w2 sorts last.
         let mru = vec!["w1".to_string(), "w2".to_string()];
         let updates = spawn(
             client,
@@ -367,7 +369,7 @@ esac
                 Ok(Message::Ready(ready)) => {
                     assert_eq!(ready.origin_workspace.as_deref(), Some("w2"));
                     let names: Vec<_> = ready.rows.iter().map(|row| row.name.as_str()).collect();
-                    assert_eq!(names, vec!["web", "api"]);
+                    assert_eq!(names, vec!["api", "web"]);
                     break;
                 }
                 Ok(Message::Failed(error)) => panic!("refresh failed: {error}"),

@@ -6,9 +6,10 @@ An agent-aware project switcher for [herdr](https://herdr.dev/) inspired by [Tmu
 
 Hit one key and you get a fuzzy list of your projects. The ones already running
 show up first, tagged with what their agent is doing (blocked, working, done, or
-idle), ordered by how recently you were in them: the workspace you opened the
-switcher from sits at the top, so Enter drops you straight back, and
-Down+Enter takes you to the one before that. Everything else sits below, one
+idle), ordered by how recently you were in them: the workspace you were in
+before opening the switcher sits at the top, so Enter jumps you straight back
+to it, while the switcher's own workspace sinks to the bottom — Escape already
+returns there. Everything else sits below, one
 keypress away from a fresh workspace.
 
 Each project maps to exactly one workspace. muster remembers that pairing from
@@ -54,13 +55,16 @@ Add this to your herdr `config.toml`, then run `herdr server reload-config`:
   open workspaces; open workspaces stay above projects. Arrow keys move the
   selection.
 - Enter jumps to the selected project. The open group is sorted
-  most-recently-used first, so Enter on the top row fast-tracks you back to
-  where you were, and Down+Enter goes to the one before that. If the project
+  most-recently-used first with the switcher's own workspace last, so Enter
+  on the top row fast-tracks you back to where you were before opening the
+  switcher. If the project
   isn't open yet, Enter musters a fresh workspace for it.
 - Hold Alt and press a number to jump straight to the matching open
-  workspace: Alt+0 is the workspace you opened the switcher from, Alt+1 the
-  one before that, and so on through Alt+9. Open rows show their number up
-  front (0–9), so the shortcut is always visible.
+  workspace: Alt+1 is the most recently used workspace — where you were
+  before opening the switcher — Alt+2 the one before that, and so on through
+  Alt+9, with Alt+0 as the tenth; the switcher's own workspace carries the
+  last number. Open rows
+  show their number up front (1–9, 0), so the shortcut is always visible.
 - Ctrl-N forces a brand new workspace for the selected directory.
 - Ctrl-X closes the selected open workspace.
 - Esc or Ctrl-C backs out.

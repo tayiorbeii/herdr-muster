@@ -213,16 +213,17 @@ fn sort_key(row: &Row, mru: &[String], origin_workspace: Option<&str>) -> (u8, u
             state,
             ..
         } => {
-            // Open workspaces rank by recency: the workspace the picker was
-            // opened from first, then the persisted most-recently-used order.
-            // Workspaces never focused through muster fall back to agent-state
-            // priority, then name.
+            // Open workspaces rank by recency: the persisted
+            // most-recently-used order first, then workspaces never focused
+            // through muster by agent-state priority and name. The workspace
+            // the picker was opened from sorts last: Escape already returns
+            // there, so the top row fast-tracks to where you were before it.
             let position = if Some(workspace_id.as_str()) == origin_workspace {
-                0
+                usize::MAX
             } else {
                 mru.iter()
                     .position(|id| id == workspace_id)
-                    .map_or(usize::MAX, |index| index + 1)
+                    .unwrap_or(usize::MAX - 1)
             };
             (0, position, state.rank(), row.name.to_lowercase())
         }
@@ -320,40 +321,47 @@ mod tests {
     }
 
     #[test]
-    fn open_rows_rank_by_most_recently_used_with_origin_first() {
+    fn open_rows_rank_by_most_recently_used_with_origin_last() {
         let mut bound = HashMap::new();
         bound.insert(PathBuf::from("/dev/web"), "w1".to_string());
         bound.insert(PathBuf::from("/dev/api"), "w2".to_string());
         bound.insert(PathBuf::from("/dev/other"), "w3".to_string());
+        bound.insert(PathBuf::from("/dev/never"), "w4".to_string());
         let workspaces = vec![
             workspace("w1", "web", "working"),
             workspace("w2", "api", "blocked"),
             workspace("w3", "other", "idle"),
+            workspace("w4", "never", "idle"),
         ];
         let panes = vec![
             pane("w1:p1", "w1", Some("/dev/web"), None),
             pane("w2:p1", "w2", Some("/dev/api"), None),
             pane("w3:p1", "w3", Some("/dev/other"), None),
+            pane("w4:p1", "w4", Some("/dev/never"), None),
         ];
         let dormant = vec![candidate("/dev/zeta")];
         let mru = vec!["w3".to_string(), "w1".to_string()];
 
-        // The workspace the picker was opened from wins, even over a blocked
-        // workspace and the previous MRU front.
+        // The workspace the picker was opened from sorts last — after the
+        // MRU order and after never-focused workspaces — because Escape
+        // already returns to it; the previous MRU front leads instead.
         let rows = assemble(&bound, &workspaces, &panes, &dormant, &mru, Some("w2"));
-        assert_eq!(rows[0].name, "api");
-        assert_eq!(rows[1].name, "other");
-        assert_eq!(rows[2].name, "web");
-        assert_eq!(rows[3].name, "zeta");
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].name, "other");
+        assert_eq!(rows[1].name, "web");
+        assert_eq!(rows[2].name, "never");
+        assert_eq!(rows[3].name, "api");
+        assert_eq!(rows[4].name, "zeta");
+        assert_eq!(rows.len(), 5);
 
         // Without an origin, persisted MRU order applies; never-focused
-        // workspaces sort after it by agent-state priority.
+        // workspaces sort after it by agent-state priority, then name.
         let rows = assemble(&bound, &workspaces, &panes, &dormant, &mru, None);
         assert_eq!(rows[0].name, "other");
         assert_eq!(rows[1].name, "web");
         assert_eq!(rows[2].name, "api");
-        assert_eq!(rows[3].name, "zeta");
+        assert_eq!(rows[3].name, "never");
+        assert_eq!(rows[4].name, "zeta");
+        assert_eq!(rows.len(), 5);
     }
 
     #[test]

@@ -78,7 +78,7 @@ fn run() -> Result<(), String> {
                 dirty = true;
             }
             // The workspace the picker was opened from is the most recently
-            // used one by definition, so Enter fast-tracks back to it.
+            // used one by definition, even though the picker ranks it last.
             if let Some(origin) = origin_workspace {
                 dirty |= registry.touch(&origin);
             }
