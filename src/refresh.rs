@@ -3,7 +3,8 @@ use crate::herdr::{command_output, CliHerdr, Herdr, Pane, TabInfo, Workspace};
 use crate::model::{self, Row};
 use crate::sources;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -12,6 +13,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const WORKER_COMPLETION_TIMEOUT: Duration = Duration::from_millis(200);
+const ZOXIDE_FALLBACK_DIRS: &[&str] = &[
+    "/opt/homebrew/bin",              // Homebrew on Apple Silicon
+    "/usr/local/bin",                 // Homebrew on Intel macOS
+    "/home/linuxbrew/.linuxbrew/bin", // Linuxbrew
+];
 
 pub struct Updates {
     receiver: Receiver<Message>,
@@ -118,6 +124,47 @@ fn load_herdr<H: Herdr>(client: &H) -> crate::herdr::Result<HerdrData> {
     })
 }
 
+fn is_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn resolve_executable(
+    name: &str,
+    path: Option<&OsStr>,
+    fallback_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    path.into_iter()
+        .flat_map(std::env::split_paths)
+        .chain(fallback_dirs.iter().cloned())
+        .map(|directory| directory.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+fn zoxide_program() -> OsString {
+    let fallback_dirs: Vec<_> = ZOXIDE_FALLBACK_DIRS.iter().map(PathBuf::from).collect();
+    resolve_executable(
+        "zoxide",
+        std::env::var_os("PATH").as_deref(),
+        &fallback_dirs,
+    )
+    .map(PathBuf::into_os_string)
+    .unwrap_or_else(|| OsString::from("zoxide"))
+}
+
 fn zoxide_lines(enabled: bool, cancellation: &AtomicBool) -> (Vec<String>, ProjectSourceStatus) {
     if !enabled {
         return (Vec::new(), ProjectSourceStatus::Disabled);
@@ -125,7 +172,7 @@ fn zoxide_lines(enabled: bool, cancellation: &AtomicBool) -> (Vec<String>, Proje
     if cancellation.load(Ordering::Relaxed) {
         return (Vec::new(), ProjectSourceStatus::Searching);
     }
-    let mut command = Command::new("zoxide");
+    let mut command = Command::new(zoxide_program());
     command.args(["query", "-l"]);
     let Ok(output) = command_output(&mut command, "zoxide query -l", Some(cancellation)) else {
         return (Vec::new(), ProjectSourceStatus::Unavailable);
@@ -315,6 +362,53 @@ mod tests {
         fn close_pane(&self, _id: &str) -> Result<()> {
             unreachable!()
         }
+    }
+
+    #[test]
+    fn resolves_zoxide_outside_a_sparse_plugin_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let inherited = temp.path().join("inherited");
+        let homebrew = temp.path().join("homebrew");
+        std::fs::create_dir_all(&inherited).unwrap();
+        std::fs::create_dir_all(&homebrew).unwrap();
+        let executable = homebrew.join("zoxide");
+        std::fs::write(&executable, "#!/bin/sh\\nexit 0\\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let path = std::env::join_paths([&inherited]).unwrap();
+        assert_eq!(
+            resolve_executable("zoxide", Some(&path), std::slice::from_ref(&homebrew)),
+            Some(executable)
+        );
+    }
+
+    #[test]
+    fn executable_from_path_precedes_fallback_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let inherited = temp.path().join("inherited");
+        let fallback = temp.path().join("fallback");
+        std::fs::create_dir_all(&inherited).unwrap();
+        std::fs::create_dir_all(&fallback).unwrap();
+        let path_executable = inherited.join("zoxide");
+        let fallback_executable = fallback.join("zoxide");
+        for executable in [&path_executable, &fallback_executable] {
+            std::fs::write(executable, "#!/bin/sh\\nexit 0\\n").unwrap();
+            let mut permissions = std::fs::metadata(executable).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(executable, permissions).unwrap();
+        }
+
+        let path = std::env::join_paths([&inherited]).unwrap();
+        assert_eq!(
+            resolve_executable("zoxide", Some(&path), std::slice::from_ref(&fallback)),
+            Some(path_executable)
+        );
     }
 
     #[test]
