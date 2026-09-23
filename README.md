@@ -93,17 +93,19 @@ unless needed to disambiguate.
   filtering searches pane labels, terminal-title fallbacks, and full paths for
   open workspaces; open workspaces stay above projects. Arrow keys move the
   selection.
-- Open rows show the workspace's unnamed pane names and its tab names as inline
-  context (`· tabs: …`). Tabs and **renamed** panes are also rows of their own —
-  sections `TABS` and `PANES` — so typing a tab name or a pane you renamed
-  filters straight to that row and Enter jumps to it (`tab.focus` for a tab,
-  `pane.focus` for a pane). Unnamed panes get no row; they stay searchable
-  through their workspace row. Tabs Herdr still labels with their own number
-  (never renamed) are hidden from both the `TABS` section and the inline tab
-  context. Alt+digit quick jumps still count workspaces
-  only, and Ctrl-N / Ctrl-X still apply to workspace/project rows only.
-  Tab metadata is best-effort: a missing or failing `herdr tab list` leaves rows
-  without tab context instead of failing the list.
+- Open rows show Herdr's space label as the primary name, with unnamed pane
+  names, collapsed path, and tab names as secondary context. Tabs and **renamed**
+  panes remain searchable rows in `TABS` and `PANES`, grouped by their parent
+  space; a single matching space appears in the section heading. Duplicate space
+  labels show a Git branch when available, otherwise a distinct directory name,
+  with Herdr's workspace number as the fallback. The picker does not expose full
+  machine paths as collision labels. Enter still focuses the exact tab or pane
+  (`tab.focus` / `pane.focus`). Unnamed panes stay searchable through their
+  workspace row. Tabs Herdr still labels with their own number (never renamed)
+  are hidden from `TABS` and inline tab context. Alt+digit quick jumps still
+  count workspaces only, and Ctrl-N / Ctrl-X still apply to workspace/project
+  rows only. Tab metadata is best-effort: a missing or failing `herdr tab list`
+  leaves rows without tab context instead of failing the list.
 - Enter jumps to the selected project. The open group is sorted
   most-recently-used first with the switcher's own workspace last, so Enter
   on the top row fast-tracks you back to where you were before opening the

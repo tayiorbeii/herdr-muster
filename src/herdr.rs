@@ -40,6 +40,7 @@ pub type Result<T> = std::result::Result<T, HerdrError>;
 pub struct Workspace {
     pub workspace_id: String,
     pub label: String,
+    pub number: Option<usize>,
     pub agent_status: String,
 }
 
@@ -144,6 +145,8 @@ struct WsItem {
     workspace_id: String,
     #[serde(default)]
     label: String,
+    #[serde(default)]
+    number: Option<usize>,
     #[serde(default)]
     agent_status: String,
 }
@@ -277,6 +280,7 @@ pub fn parse_workspaces(json: &str) -> Result<Vec<Workspace>> {
             // available, so apply the same terminal-control filtering as pane
             // names before they reach Ratatui.
             label: clean(Some(workspace.label)).unwrap_or_default(),
+            number: workspace.number,
             agent_status: if workspace.agent_status.is_empty() {
                 "unknown".into()
             } else {
@@ -744,7 +748,7 @@ impl Herdr for CliHerdr {
 mod tests {
     use super::*;
 
-    const WS: &str = r#"{"result":{"type":"workspace_list","workspaces":[{"workspace_id":"w5","label":"~","agent_status":"working"},{"workspace_id":"w6","label":"/tmp","agent_status":""}]}}"#;
+    const WS: &str = r#"{"result":{"type":"workspace_list","workspaces":[{"workspace_id":"w5","label":"~","number":5,"agent_status":"working"},{"workspace_id":"w6","label":"/tmp","number":6,"agent_status":""}]}}"#;
     const CR: &str = r#"{"result":{"workspace":{"workspace_id":"w9"},"root_pane":{"cwd":"/p"},"type":"workspace_created"}}"#;
     const PN: &str = r#"{"result":{"type":"pane_list","panes":[{"pane_id":"wE:p1","workspace_id":"wE","cwd":"/home/x/dev/api","agent":"claude","agent_status":"working","label":"api-shell","terminal_title_stripped":"π - api"},{"pane_id":"wE:p2","workspace_id":"wE","cwd":"/tmp","terminal_title_stripped":"π - tmp"},{"pane_id":"wB:pA","workspace_id":"wB"}]}}"#;
 
@@ -752,6 +756,7 @@ mod tests {
     fn parses_workspaces_with_status_default() {
         let workspaces = parse_workspaces(WS).unwrap();
         assert_eq!(workspaces[0].workspace_id, "w5");
+        assert_eq!(workspaces[0].number, Some(5));
         assert_eq!(workspaces[0].agent_status, "working");
         assert_eq!(workspaces[1].agent_status, "unknown");
     }

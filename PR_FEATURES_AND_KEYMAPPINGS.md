@@ -80,10 +80,14 @@ maps to exactly one workspace, remembered from the moment muster creates it.
   independently and the strongest kept — a fuzzy subsequence can never cross
   metadata boundaries (e.g. `deadpo` cannot match a row whose *name* is
   `instructional-design-agent` via its path).
-- Open rows show the workspace's **tab names** as `· tabs: <labels>` next to the
-  collapsed path, and tabs plus renamed panes are rows in their own sections:
-  `TABS` lists one row per tab and `PANES` lists only panes the user renamed.
-  Both are searchable by label and jumpable with Enter — `tab.focus` for a tab,
+- Open rows use Herdr's human-facing **space label** as their primary text;
+  unnamed-pane summaries, collapsed paths, and tab names remain secondary
+  context. `TABS` and `PANES` rows are grouped by their parent space (the section
+  heading names a sole matching space; multiple matches get space subheaders).
+  Duplicate space labels are disambiguated by Git branch when available, then a
+  distinct directory basename, and finally Herdr's workspace number. Full
+  machine paths are not added as collision labels. Tabs and renamed panes remain
+  searchable by label and jumpable with Enter — `tab.focus` for a tab,
   `pane.focus` for a renamed pane. Unnamed panes have no row of their own and
   stay searchable through their workspace row. Tabs whose label is still just
   their position number (never renamed) are hidden from the `TABS` section and

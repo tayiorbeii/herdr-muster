@@ -229,6 +229,12 @@ impl SearchDocument {
         let mut fields = Vec::new();
         push_unique(&mut fields, row.name.clone());
         push_unique(&mut fields, row.display.clone());
+        if let Some(space) = &row.space {
+            push_unique(&mut fields, space.label.clone());
+            if let Some(disambiguator) = &space.disambiguator {
+                push_unique(&mut fields, disambiguator.clone());
+            }
+        }
 
         match &row.kind {
             Kind::Open { state, agent, .. } => {
@@ -289,6 +295,45 @@ fn section(kind: &Kind) -> u8 {
     }
 }
 
+fn group_indices_by_space(rows: &[Row], indices: Vec<usize>, alphabetical: bool) -> Vec<usize> {
+    let mut groups: Vec<(Option<(String, Option<String>)>, Vec<usize>)> = Vec::new();
+    for index in indices {
+        let row = &rows[index];
+        let key = if matches!(&row.kind, Kind::Tab { .. } | Kind::Pane { .. }) {
+            row.space
+                .as_ref()
+                .map(|space| (space.label.clone(), space.disambiguator.clone()))
+        } else {
+            None
+        };
+        if let Some(key) = key {
+            if let Some((_, members)) = groups
+                .iter_mut()
+                .find(|(existing, _)| existing.as_ref() == Some(&key))
+            {
+                members.push(index);
+            } else {
+                groups.push((Some(key), vec![index]));
+            }
+        } else {
+            // Unknown context is not enough evidence to merge unrelated rows.
+            groups.push((None, vec![index]));
+        }
+    }
+    if alphabetical {
+        groups.sort_by(|(left, _), (right, _)| match (left, right) {
+            (Some(left), Some(right)) => left.cmp(right),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        });
+    }
+    groups
+        .into_iter()
+        .flat_map(|(_, members)| members)
+        .collect()
+}
+
 fn push_unique(fields: &mut Vec<String>, value: String) {
     if !value.is_empty() && !fields.iter().any(|existing| existing == &value) {
         fields.push(value);
@@ -302,6 +347,10 @@ fn filter(rows: &[Row], query: &str, matcher: &mut Matcher) -> Vec<usize> {
         let mut sections: Vec<Vec<usize>> = vec![Vec::new(); 4];
         for index in 0..rows.len() {
             sections[section(&rows[index].kind) as usize].push(index);
+        }
+        for group in [1, 2] {
+            sections[group] =
+                group_indices_by_space(rows, std::mem::take(&mut sections[group]), true);
         }
         return sections.into_iter().flatten().collect();
     }
@@ -331,11 +380,14 @@ fn filter(rows: &[Row], query: &str, matcher: &mut Matcher) -> Vec<usize> {
     for bucket in &mut sections {
         bucket.sort_by(rank);
     }
-    sections
+    let mut sections: Vec<Vec<usize>> = sections
         .into_iter()
-        .flatten()
-        .map(|(_, index)| index)
-        .collect()
+        .map(|bucket| bucket.into_iter().map(|(_, index)| index).collect())
+        .collect();
+    for group in [1, 2] {
+        sections[group] = group_indices_by_space(rows, std::mem::take(&mut sections[group]), false);
+    }
+    sections.into_iter().flatten().collect()
 }
 
 fn display_width(value: &str) -> usize {
@@ -398,7 +450,7 @@ fn truncate_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Span<'stat
     output
 }
 
-fn pane_label(row: &Row) -> String {
+fn pane_summary(row: &Row) -> Option<String> {
     let mut seen = HashSet::new();
     let unique: Vec<&str> = row
         .pane_names
@@ -407,10 +459,10 @@ fn pane_label(row: &Row) -> String {
         .filter(|name| seen.insert(*name))
         .collect();
     match unique.as_slice() {
-        [] => row.name.clone(),
-        [name] => (*name).to_string(),
-        [first, second] => format!("{first} · {second}"),
-        [first, second, rest @ ..] => format!("{first} · {second} +{}", rest.len()),
+        [] => None,
+        [name] => Some((*name).to_string()),
+        [first, second] => Some(format!("{first} · {second}")),
+        [first, second, rest @ ..] => Some(format!("{first} · {second} +{}", rest.len())),
     }
 }
 
@@ -431,8 +483,28 @@ fn tab_summary(row: &Row) -> Option<String> {
     }
 }
 
-/// Muted half of an open row: the collapsed path plus optional tab context.
+/// Muted context keeps the selected space's contents while its human-facing
+/// name is promoted to the primary open-row label.
 fn secondary_context(row: &Row) -> String {
+    if matches!(&row.kind, Kind::Open { .. }) {
+        let mut parts = Vec::new();
+        if let Some(space) = &row.space {
+            if let Some(disambiguator) = &space.disambiguator {
+                parts.push(disambiguator.clone());
+            }
+        }
+        if let Some(panes) = pane_summary(row) {
+            parts.push(format!("panes: {panes}"));
+        }
+        if !row.display.is_empty() {
+            parts.push(row.display.clone());
+        }
+        if let Some(tabs) = tab_summary(row) {
+            parts.push(format!("tabs: {tabs}"));
+        }
+        return parts.join(" · ");
+    }
+
     match tab_summary(row) {
         Some(tabs) if row.display.is_empty() => format!("tabs: {tabs}"),
         Some(tabs) => format!("{} · tabs: {tabs}", row.display),
@@ -537,7 +609,9 @@ fn row_line(row: &Row, width: usize, number: Option<usize>) -> Line<'static> {
             number,
             *state,
             agent.as_deref(),
-            &pane_label(row),
+            row.space
+                .as_ref()
+                .map_or(row.name.as_str(), |space| space.label.as_str()),
         ),
         // Tabs and renamed panes are ordinary rows too; they just never carry
         // an Alt+digit number because that numbering is workspace-only.
@@ -571,28 +645,92 @@ fn header_item(label: &str, suffix: &str, width: usize) -> ListItem<'static> {
     ListItem::new(Line::from(truncate_spans(spans, width)))
 }
 
+fn section_spaces(rows: &[Row], filtered: &[usize], group: u8) -> Vec<crate::model::SpaceContext> {
+    let mut spaces = Vec::new();
+    for row_index in filtered.iter().copied() {
+        let row = &rows[row_index];
+        if section(&row.kind) != group {
+            continue;
+        }
+        let Some(space) = &row.space else { continue };
+        if !spaces.iter().any(|existing: &crate::model::SpaceContext| {
+            existing.label == space.label && existing.disambiguator == space.disambiguator
+        }) {
+            spaces.push(space.clone());
+        }
+    }
+    spaces
+}
+
+fn space_header_item(space: &crate::model::SpaceContext, width: usize) -> ListItem<'static> {
+    let mut spans = vec![
+        Span::styled(
+            "  ▸ SPACE · ",
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            space.label.clone(),
+            Style::default().fg(FG).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(disambiguator) = &space.disambiguator {
+        spans.push(Span::styled(
+            format!(" · {disambiguator}"),
+            Style::default().fg(FAINT),
+        ));
+    }
+    ListItem::new(Line::from(truncate_spans(spans, width)))
+}
+
 fn build(
     rows: &[Row],
     filtered: &[usize],
     selected: usize,
     width: usize,
 ) -> (Vec<ListItem<'static>>, usize) {
+    let tab_spaces = section_spaces(rows, filtered, 1);
+    let pane_spaces = section_spaces(rows, filtered, 2);
     let mut items = Vec::new();
     let mut selected_position = 0;
     let mut last_group = None;
+    let mut last_space: Option<(String, Option<String>)> = None;
     let mut open_index = 0usize;
     for (filtered_index, row_index) in filtered.iter().copied().enumerate() {
         let row = &rows[row_index];
         let group = section(&row.kind);
+        let spaces: &[crate::model::SpaceContext] = match group {
+            1 => &tab_spaces,
+            2 => &pane_spaces,
+            _ => &[],
+        };
         if last_group != Some(group) {
-            let (label, suffix) = match group {
+            let (label, default_suffix) = match group {
                 0 => ("OPEN", "LIVE WORKSPACES"),
                 1 => ("TABS", "OPEN WORKSPACES"),
                 2 => ("PANES", "RENAMED"),
                 _ => ("PROJECTS", "NOT OPEN YET"),
             };
-            items.push(header_item(label, suffix, width));
+            let suffix = if spaces.len() == 1 {
+                let space = &spaces[0];
+                match &space.disambiguator {
+                    Some(disambiguator) => format!("IN {} · {disambiguator}", space.label),
+                    None => format!("IN SPACE {}", space.label),
+                }
+            } else {
+                default_suffix.to_string()
+            };
+            items.push(header_item(label, &suffix, width));
             last_group = Some(group);
+            last_space = None;
+        }
+        if spaces.len() > 1 && matches!(group, 1 | 2) {
+            if let Some(space) = &row.space {
+                let key = (space.label.clone(), space.disambiguator.clone());
+                if last_space.as_ref() != Some(&key) {
+                    items.push(space_header_item(space, width));
+                    last_space = Some(key);
+                }
+            }
         }
         if filtered_index == selected {
             selected_position = items.len();
@@ -979,6 +1117,11 @@ mod tests {
             display: display.into(),
             pane_names: pane_names.iter().map(|name| (*name).into()).collect(),
             tab_names: Vec::new(),
+            space: Some(crate::model::SpaceContext {
+                label: name.into(),
+                disambiguator: None,
+                number: None,
+            }),
             kind: Kind::Open {
                 workspace_id: name.into(),
                 state: AgentState::Working,
@@ -1006,6 +1149,7 @@ mod tests {
             display: display.into(),
             pane_names: Vec::new(),
             tab_names: Vec::new(),
+            space: None,
             kind: Kind::Dormant,
         }
     }
@@ -1040,6 +1184,8 @@ mod tests {
             &["api server", "logs"],
         );
         let line = row_line(&labeled, 120, None).to_string();
+        assert!(line.contains("workspace"), "{line}");
+        assert!(line.contains("panes: editor"), "{line}");
         assert!(line.contains("tabs: api server · logs"), "{line}");
 
         let plain = open("workspace", "~/work", "/Users/me/work", &["editor"]);
@@ -1243,7 +1389,7 @@ mod tests {
             "/api",
             &["editor", "editor", "tests", "shell"],
         );
-        assert_eq!(pane_label(&row), "editor · tests +1");
+        assert_eq!(pane_summary(&row).as_deref(), Some("editor · tests +1"));
     }
 
     #[test]
@@ -1303,6 +1449,11 @@ mod tests {
             display: display.into(),
             pane_names: Vec::new(),
             tab_names: Vec::new(),
+            space: Some(crate::model::SpaceContext {
+                label: workspace.into(),
+                disambiguator: None,
+                number: None,
+            }),
             kind: Kind::Tab {
                 workspace_id: workspace.into(),
                 tab_id: tab_id.into(),
@@ -1319,6 +1470,11 @@ mod tests {
             display: display.into(),
             pane_names: Vec::new(),
             tab_names: Vec::new(),
+            space: Some(crate::model::SpaceContext {
+                label: workspace.into(),
+                disambiguator: None,
+                number: None,
+            }),
             kind: Kind::Pane {
                 workspace_id: workspace.into(),
                 tab_id: Some("w1:t1".into()),
@@ -1327,6 +1483,40 @@ mod tests {
                 agent: None,
             },
         }
+    }
+
+    #[test]
+    fn parent_space_labels_match_and_group_child_rows() {
+        let mut first = tab_row(
+            "Research: MTF bull-run rules audit",
+            "w1",
+            "w1:t1",
+            "~/work · w1:t1",
+        );
+        first.space.as_mut().unwrap().label = "newsletter".into();
+        let mut second = tab_row("Research: onset day1/day2", "w1", "w1:t2", "~/work · w1:t2");
+        second.space.as_mut().unwrap().label = "newsletter".into();
+        let mut third = tab_row("api logs", "w2", "w2:t1", "~/api · w2:t1");
+        third.space.as_mut().unwrap().label = "pi-planning-profile".into();
+        let rows = vec![
+            open("workspace", "~/work", "/Users/me/work", &["shell"]),
+            first,
+            second,
+            third,
+        ];
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+
+        assert_eq!(filter(&rows, "newsletter", &mut matcher), vec![1, 2]);
+        let filtered = vec![0, 1, 2, 3];
+        let (items, selected_position) = build(&rows, &filtered, 3, 100);
+        let debug: Vec<String> = items.iter().map(|item| format!("{item:?}")).collect();
+        assert!(debug
+            .iter()
+            .any(|item| item.contains("SPACE") && item.contains("newsletter")));
+        assert!(debug
+            .iter()
+            .any(|item| item.contains("SPACE") && item.contains("pi-planning-profile")));
+        assert_eq!(selected_position, 7);
     }
 
     #[test]

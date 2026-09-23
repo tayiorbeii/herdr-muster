@@ -165,6 +165,50 @@ fn zoxide_program() -> OsString {
     .unwrap_or_else(|| OsString::from("zoxide"))
 }
 
+fn duplicate_space_branches(rows: &[Row], cancellation: &AtomicBool) -> HashMap<String, String> {
+    let mut label_counts = HashMap::new();
+    for row in rows {
+        if matches!(&row.kind, model::Kind::Open { .. }) {
+            if let Some(space) = &row.space {
+                *label_counts.entry(space.label.clone()).or_insert(0usize) += 1;
+            }
+        }
+    }
+
+    let mut branches = HashMap::new();
+    for row in rows {
+        if cancellation.load(Ordering::Relaxed) {
+            break;
+        }
+        let (model::Kind::Open { workspace_id, .. }, Some(space)) = (&row.kind, &row.space) else {
+            continue;
+        };
+        if label_counts.get(&space.label).copied().unwrap_or_default() < 2 {
+            continue;
+        }
+
+        let mut command = Command::new("git");
+        command
+            .arg("-C")
+            .arg(&row.path)
+            .args(["branch", "--show-current"])
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let Ok(output) = command_output(&mut command, "git branch lookup", Some(cancellation))
+        else {
+            continue;
+        };
+        if output.status.success() {
+            let branch =
+                crate::herdr::sanitize_text(String::from_utf8_lossy(&output.stdout).trim());
+            if !branch.trim().is_empty() {
+                branches.insert(workspace_id.clone(), branch);
+            }
+        }
+    }
+    branches
+}
+
 fn zoxide_lines(enabled: bool, cancellation: &AtomicBool) -> (Vec<String>, ProjectSourceStatus) {
     if !enabled {
         return (Vec::new(), ProjectSourceStatus::Disabled);
@@ -230,7 +274,7 @@ pub fn spawn(
                 .map(|pane| pane.workspace_id.clone())
         });
 
-        let open_rows = model::assemble(
+        let mut open_rows = model::assemble(
             &bound,
             &data.workspaces,
             &data.panes,
@@ -240,13 +284,32 @@ pub fn spawn(
             origin_workspace.as_deref(),
         );
         let partial = Snapshot {
-            rows: open_rows,
+            rows: open_rows.clone(),
             project_source_status: ProjectSourceStatus::Searching,
             live_workspace_ids: data.live_workspace_ids.clone(),
             origin_workspace: origin_workspace.clone(),
         };
         if sender.send(Message::Partial(partial)).is_err() {
             return;
+        }
+
+        let branches = duplicate_space_branches(&open_rows, &worker_cancellation);
+        if worker_cancellation.load(Ordering::Relaxed) {
+            return;
+        }
+        if !branches.is_empty() {
+            model::apply_space_disambiguators(&mut open_rows, &branches);
+            if sender
+                .send(Message::Partial(Snapshot {
+                    rows: open_rows.clone(),
+                    project_source_status: ProjectSourceStatus::Searching,
+                    live_workspace_ids: data.live_workspace_ids.clone(),
+                    origin_workspace: origin_workspace.clone(),
+                }))
+                .is_err()
+            {
+                return;
+            }
         }
 
         let (zoxide_candidates, project_source_status) =
@@ -262,7 +325,7 @@ pub fn spawn(
         if worker_cancellation.load(Ordering::Relaxed) {
             return;
         }
-        let rows = model::assemble(
+        let mut rows = model::assemble(
             &bound,
             &data.workspaces,
             &data.panes,
@@ -271,6 +334,7 @@ pub fn spawn(
             &mru,
             origin_workspace.as_deref(),
         );
+        model::apply_space_disambiguators(&mut rows, &branches);
         let _ = sender.send(Message::Ready(Snapshot {
             rows,
             project_source_status,
@@ -304,6 +368,7 @@ mod tests {
                 Ok(vec![Workspace {
                     workspace_id: "w1".into(),
                     label: "api".into(),
+                    number: None,
                     agent_status: "working".into(),
                 }])
             }
@@ -588,6 +653,7 @@ esac
             Ok(vec![Workspace {
                 workspace_id: "w1".into(),
                 label: "api".into(),
+                number: None,
                 agent_status: "idle".into(),
             }])
         }

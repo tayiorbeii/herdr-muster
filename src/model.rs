@@ -89,6 +89,13 @@ pub enum RowId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceContext {
+    pub label: String,
+    pub disambiguator: Option<String>,
+    pub number: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     pub name: String,
     pub path: PathBuf,
@@ -97,6 +104,8 @@ pub struct Row {
     pub pane_names: Vec<String>,
     /// Human-readable labels of the workspace's tabs, in Herdr response order.
     pub tab_names: Vec<String>,
+    /// Human-facing Herdr space identity for live workspace, tab, and pane rows.
+    pub space: Option<SpaceContext>,
     pub kind: Kind,
 }
 
@@ -219,7 +228,7 @@ pub fn assemble(
         let agent = root.and_then(|pane| pane.agent.clone());
         let state = AgentState::from_str(&workspace.agent_status);
 
-        let (name, display, path) = match directory {
+        let (directory_name, display, path) = match directory {
             Some(directory) => (
                 display_name_for(&directory),
                 crate::herdr::sanitize_text(&collapse_home(&directory)),
@@ -233,6 +242,17 @@ pub fn assemble(
                 };
                 (fallback.clone(), fallback.clone(), PathBuf::from(fallback))
             }
+        };
+        let workspace_label = crate::herdr::sanitize_text(&workspace.label);
+        let name = if workspace_label.trim().is_empty() {
+            directory_name
+        } else {
+            workspace_label.trim().to_string()
+        };
+        let space = SpaceContext {
+            label: name.clone(),
+            disambiguator: None,
+            number: workspace.number,
         };
         open_directories.insert(path.clone());
 
@@ -256,6 +276,7 @@ pub fn assemble(
                 path: path.clone(),
                 pane_names: Vec::new(),
                 tab_names: Vec::new(),
+                space: Some(space.clone()),
                 kind: Kind::Tab {
                     workspace_id: workspace.workspace_id.clone(),
                     tab_id: tab.tab_id.clone(),
@@ -283,6 +304,7 @@ pub fn assemble(
                 path: path.clone(),
                 pane_names: Vec::new(),
                 tab_names: Vec::new(),
+                space: Some(space.clone()),
                 kind: Kind::Pane {
                     workspace_id: workspace.workspace_id.clone(),
                     tab_id: pane.tab_id.clone(),
@@ -299,6 +321,7 @@ pub fn assemble(
             path,
             pane_names: pane_names.get(id).cloned().unwrap_or_default(),
             tab_names: tab_names.get(id).cloned().unwrap_or_default(),
+            space: Some(space),
             kind: Kind::Open {
                 workspace_id: workspace.workspace_id.clone(),
                 state,
@@ -317,9 +340,12 @@ pub fn assemble(
             path: candidate.path.clone(),
             pane_names: Vec::new(),
             tab_names: Vec::new(),
+            space: None,
             kind: Kind::Dormant,
         });
     }
+
+    apply_space_disambiguators(&mut rows, &HashMap::new());
 
     // `sort_by` is stable, so project source order is preserved within the
     // lower-priority project section (recent history, configured paths, roots,
@@ -329,6 +355,92 @@ pub fn assemble(
         _ => sort_key(left, mru, origin_workspace).cmp(&sort_key(right, mru, origin_workspace)),
     });
     rows
+}
+
+/// Add compact, collision-only parent-space context. Prefer a branch name,
+/// then a distinct directory basename, and finally Herdr's public number.
+pub fn apply_space_disambiguators(rows: &mut [Row], branches: &HashMap<String, String>) {
+    let mut groups: HashMap<String, Vec<(String, PathBuf, Option<usize>)>> = HashMap::new();
+    for row in rows.iter() {
+        let (Kind::Open { workspace_id, .. }, Some(space)) = (&row.kind, &row.space) else {
+            continue;
+        };
+        groups.entry(space.label.clone()).or_default().push((
+            workspace_id.clone(),
+            row.path.clone(),
+            space.number,
+        ));
+    }
+
+    let mut hints = HashMap::new();
+    for (label, workspaces) in groups
+        .into_iter()
+        .filter(|(_, workspaces)| workspaces.len() > 1)
+    {
+        let mut candidates = Vec::with_capacity(workspaces.len());
+        for (workspace_id, path, number) in workspaces {
+            let branch = branches
+                .get(&workspace_id)
+                .map(|branch| crate::herdr::sanitize_text(branch).trim().to_string())
+                .filter(|branch| !branch.is_empty());
+            let folder = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(crate::herdr::sanitize_text)
+                .filter(|folder| !folder.is_empty());
+            let hint = if let Some(branch) = branch {
+                format!("branch: {branch}")
+            } else if let Some(folder) = folder.as_deref().filter(|folder| *folder != label) {
+                format!("folder: {folder}")
+            } else if let Some(number) = number {
+                format!("space #{number}")
+            } else {
+                format!("space {workspace_id}")
+            };
+            candidates.push((workspace_id, hint, folder, number));
+        }
+
+        let mut counts = HashMap::new();
+        for (_, hint, _, _) in &candidates {
+            *counts.entry(hint.clone()).or_insert(0usize) += 1;
+        }
+        let mut resolved = Vec::with_capacity(candidates.len());
+        for (workspace_id, mut hint, folder, number) in candidates {
+            if counts.get(&hint).copied().unwrap_or_default() > 1 {
+                if let Some(folder) = folder.as_deref() {
+                    hint.push_str(&format!(" · folder: {folder}"));
+                }
+            }
+            resolved.push((workspace_id, hint, number));
+        }
+
+        let mut resolved_counts = HashMap::new();
+        for (_, hint, _) in &resolved {
+            *resolved_counts.entry(hint.clone()).or_insert(0usize) += 1;
+        }
+        for (workspace_id, mut hint, number) in resolved {
+            if resolved_counts.get(&hint).copied().unwrap_or_default() > 1 {
+                if let Some(number) = number {
+                    hint.push_str(&format!(" · #{number}"));
+                } else {
+                    hint.push_str(&format!(" · {workspace_id}"));
+                }
+            }
+            hints.insert(workspace_id, hint);
+        }
+    }
+
+    for row in rows {
+        let workspace_id = match &row.kind {
+            Kind::Open { workspace_id, .. }
+            | Kind::Tab { workspace_id, .. }
+            | Kind::Pane { workspace_id, .. } => workspace_id,
+            Kind::Dormant => continue,
+        };
+        if let (Some(space), Some(hint)) = (row.space.as_mut(), hints.get(workspace_id)) {
+            space.disambiguator = Some(hint.clone());
+        }
+    }
 }
 
 fn sort_key(row: &Row, mru: &[String], origin_workspace: Option<&str>) -> (u8, usize, u8, String) {
@@ -366,6 +478,7 @@ mod tests {
         Workspace {
             workspace_id: id.into(),
             label: label.into(),
+            number: None,
             agent_status: status.into(),
         }
     }
@@ -551,6 +664,92 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_space_labels_use_branch_folder_and_number_hints() {
+        let mut first = workspace("w4", "seer-agentic-readiness-audit", "working");
+        first.number = Some(4);
+        let mut second = workspace("w19", "seer-agentic-readiness-audit", "idle");
+        second.number = Some(19);
+        let workspaces = vec![first, second];
+        let panes = vec![
+            pane(
+                "w4:p1",
+                "w4",
+                Some("/tmp/seer-agentic-readiness-audit"),
+                None,
+            ),
+            pane("w19:p1", "w19", Some("/tmp/seer-apps-turborepo"), None),
+        ];
+        let mut rows = assemble(&HashMap::new(), &workspaces, &panes, &[], &[], &[], None);
+        let initial_hints: Vec<_> = rows
+            .iter()
+            .filter(|row| matches!(row.kind, Kind::Open { .. }))
+            .map(|row| row.space.as_ref().unwrap().disambiguator.clone().unwrap())
+            .collect();
+        assert_eq!(initial_hints, ["space #4", "folder: seer-apps-turborepo"]);
+
+        let mut branches = HashMap::new();
+        branches.insert(
+            "w4".to_string(),
+            "fix/ara-lighthouse-metrics-redaction".to_string(),
+        );
+        apply_space_disambiguators(&mut rows, &branches);
+
+        let first_hint = rows
+            .iter()
+            .find(
+                |row| matches!(&row.kind, Kind::Open { workspace_id, .. } if workspace_id == "w4"),
+            )
+            .unwrap()
+            .space
+            .as_ref()
+            .unwrap();
+        let second_hint = rows
+            .iter()
+            .find(
+                |row| matches!(&row.kind, Kind::Open { workspace_id, .. } if workspace_id == "w19"),
+            )
+            .unwrap()
+            .space
+            .as_ref()
+            .unwrap();
+        assert_eq!(first_hint.label, "seer-agentic-readiness-audit");
+        assert_eq!(
+            first_hint.disambiguator.as_deref(),
+            Some("branch: fix/ara-lighthouse-metrics-redaction")
+        );
+        assert_eq!(
+            second_hint.disambiguator.as_deref(),
+            Some("folder: seer-apps-turborepo")
+        );
+    }
+
+    #[test]
+    fn identical_space_roots_fall_back_to_herdr_numbers() {
+        let mut first = workspace("w4", "newsletter", "working");
+        first.number = Some(4);
+        let mut second = workspace("w19", "newsletter", "idle");
+        second.number = Some(19);
+        let rows = assemble(
+            &HashMap::new(),
+            &[first, second],
+            &[
+                pane("w4:p1", "w4", Some("/tmp/newsletter"), None),
+                pane("w19:p1", "w19", Some("/tmp/newsletter"), None),
+            ],
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        let hints: Vec<_> = rows
+            .iter()
+            .filter(|row| matches!(row.kind, Kind::Open { .. }))
+            .map(|row| row.space.as_ref().unwrap().disambiguator.clone().unwrap())
+            .collect();
+        assert_eq!(hints, ["space #4", "space #19"]);
+    }
+
+    #[test]
     fn row_identity_is_stable() {
         let open = Row {
             name: "api".into(),
@@ -558,6 +757,11 @@ mod tests {
             display: "/api".into(),
             pane_names: Vec::new(),
             tab_names: Vec::new(),
+            space: Some(SpaceContext {
+                label: "api".into(),
+                disambiguator: None,
+                number: None,
+            }),
             kind: Kind::Open {
                 workspace_id: "w1".into(),
                 state: AgentState::Idle,
