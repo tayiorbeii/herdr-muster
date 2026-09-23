@@ -57,6 +57,7 @@ where
             out.push(p);
         }
     }
+    out.sort();
     Some(out)
 }
 
@@ -115,6 +116,7 @@ fn finalize(raw: Vec<PathBuf>, cancellation: &AtomicBool) -> Option<Vec<Candidat
 fn gather_with_checkpoint<F>(
     cfg: &Config,
     zoxide_lines: &[String],
+    recent_paths: &[PathBuf],
     cancellation: &AtomicBool,
     checkpoint: &mut F,
 ) -> Option<Vec<Candidate>>
@@ -122,6 +124,15 @@ where
     F: FnMut(),
 {
     let mut raw: Vec<PathBuf> = Vec::new();
+    // Herdr-opened project history is independent of current workspace bindings
+    // and remains eligible even when a project is not a git repository.
+    for path in recent_paths {
+        checkpoint();
+        if cancelled(cancellation) {
+            return None;
+        }
+        raw.push(path.clone());
+    }
     // Explicit paths bypass the repo-root filter — user opted in by naming them.
     for p in &cfg.paths {
         checkpoint();
@@ -159,12 +170,22 @@ where
 
 /// Returns `None` when cancellation interrupts discovery, so callers do not
 /// mistake a partial traversal for a complete project snapshot.
-pub fn gather(
+#[cfg(test)]
+fn gather(
     cfg: &Config,
     zoxide_lines: &[String],
     cancellation: &AtomicBool,
 ) -> Option<Vec<Candidate>> {
-    gather_with_checkpoint(cfg, zoxide_lines, cancellation, &mut || {})
+    gather_with_recent(cfg, zoxide_lines, &[], cancellation)
+}
+
+pub fn gather_with_recent(
+    cfg: &Config,
+    zoxide_lines: &[String],
+    recent_paths: &[PathBuf],
+    cancellation: &AtomicBool,
+) -> Option<Vec<Candidate>> {
+    gather_with_checkpoint(cfg, zoxide_lines, recent_paths, cancellation, &mut || {})
 }
 
 #[cfg(test)]
@@ -213,6 +234,32 @@ mod tests {
     }
 
     #[test]
+    fn gather_includes_previously_opened_non_repo_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first-opened");
+        let most_recent = tmp.path().join("most-recent");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&most_recent).unwrap();
+        let cancellation = AtomicBool::new(false);
+
+        let got = gather_with_recent(
+            &Config {
+                paths: Vec::new(),
+                roots: Vec::new(),
+                use_zoxide: false,
+            },
+            &[],
+            &[most_recent.clone(), first.clone()],
+            &cancellation,
+        )
+        .unwrap();
+
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].path, fs::canonicalize(most_recent).unwrap());
+        assert_eq!(got[1].path, fs::canonicalize(first).unwrap());
+    }
+
+    #[test]
     fn gather_stops_promptly_when_cancelled_mid_root_traversal() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("projects");
@@ -231,7 +278,7 @@ mod tests {
 
         let worker = thread::spawn(move || {
             let mut checkpoints = 0;
-            let result = gather_with_checkpoint(&cfg, &[], &worker_cancellation, &mut || {
+            let result = gather_with_checkpoint(&cfg, &[], &[], &worker_cancellation, &mut || {
                 checkpoints += 1;
                 // The first checkpoint is before the root traversal; the
                 // second is after read_dir yielded its first filesystem entry.

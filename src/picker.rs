@@ -1,5 +1,5 @@
 use crate::model::{AgentState, Kind, Row};
-use crate::refresh::{Message as RefreshMessage, Snapshot, Updates};
+use crate::refresh::{Message as RefreshMessage, ProjectSourceStatus, Snapshot, Updates};
 use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal};
@@ -9,6 +9,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph};
 use std::collections::HashSet;
 use std::io::{self, stdout};
+use std::path::Path;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
@@ -143,6 +144,14 @@ impl PickerState {
         self.apply_snapshot(snapshot, matcher);
     }
 
+    /// Absolute paths for live workspaces observed in this picker snapshot.
+    pub fn open_workspace_paths(&self) -> impl Iterator<Item = &Path> {
+        self.rows
+            .iter()
+            .filter(|row| matches!(row.kind, Kind::Open { .. }))
+            .map(|row| row.path.as_path())
+    }
+
     pub fn remove(&mut self, id: &crate::model::RowId) {
         self.rows.retain(|row| row.id() != *id);
         let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
@@ -221,18 +230,62 @@ impl SearchDocument {
         push_unique(&mut fields, row.name.clone());
         push_unique(&mut fields, row.display.clone());
 
-        if let Kind::Open { state, agent, .. } = &row.kind {
-            push_unique(&mut fields, row.path.display().to_string());
-            push_unique(&mut fields, state.word().to_string());
-            if let Some(agent) = agent {
-                push_unique(&mut fields, agent.clone());
+        match &row.kind {
+            Kind::Open { state, agent, .. } => {
+                push_unique(&mut fields, row.path.display().to_string());
+                push_unique(&mut fields, state.word().to_string());
+                if let Some(agent) = agent {
+                    push_unique(&mut fields, agent.clone());
+                }
+                for pane_name in &row.pane_names {
+                    push_unique(&mut fields, pane_name.clone());
+                }
             }
-            for pane_name in &row.pane_names {
-                push_unique(&mut fields, pane_name.clone());
+            Kind::Tab {
+                state,
+                agent,
+                tab_id,
+                ..
+            } => {
+                push_unique(&mut fields, row.path.display().to_string());
+                push_unique(&mut fields, tab_id.clone());
+                push_unique(&mut fields, state.word().to_string());
+                if let Some(agent) = agent {
+                    push_unique(&mut fields, agent.clone());
+                }
             }
+            Kind::Pane {
+                state,
+                agent,
+                pane_id,
+                tab_id,
+                ..
+            } => {
+                push_unique(&mut fields, row.path.display().to_string());
+                push_unique(&mut fields, pane_id.clone());
+                if let Some(tab_id) = tab_id {
+                    push_unique(&mut fields, tab_id.clone());
+                }
+                push_unique(&mut fields, state.word().to_string());
+                if let Some(agent) = agent {
+                    push_unique(&mut fields, agent.clone());
+                }
+            }
+            Kind::Dormant => {}
         }
 
         SearchDocument(fields)
+    }
+}
+
+/// Section order: live workspaces, their tabs, renamed panes, then projects.
+/// Only the first section participates in the Alt+digit quick jumps.
+fn section(kind: &Kind) -> u8 {
+    match kind {
+        Kind::Open { .. } => 0,
+        Kind::Tab { .. } => 1,
+        Kind::Pane { .. } => 2,
+        Kind::Dormant => 3,
     }
 }
 
@@ -242,19 +295,20 @@ fn push_unique(fields: &mut Vec<String>, value: String) {
     }
 }
 
-/// Return original row indices, ranked within each section. Open rows always
-/// precede project rows, including when the query is empty.
+/// Return original row indices, ranked within each section. Sections always
+/// appear in `section()` order, including when the query is empty.
 fn filter(rows: &[Row], query: &str, matcher: &mut Matcher) -> Vec<usize> {
     if query.is_empty() {
-        let (open, projects): (Vec<_>, Vec<_>) =
-            (0..rows.len()).partition(|index| matches!(rows[*index].kind, Kind::Open { .. }));
-        return open.into_iter().chain(projects).collect();
+        let mut sections: Vec<Vec<usize>> = vec![Vec::new(); 4];
+        for index in 0..rows.len() {
+            sections[section(&rows[index].kind) as usize].push(index);
+        }
+        return sections.into_iter().flatten().collect();
     }
 
     let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
     let mut buffer = Vec::new();
-    let mut open = Vec::new();
-    let mut projects = Vec::new();
+    let mut sections: Vec<Vec<(u32, usize)>> = vec![Vec::new(); 4];
 
     for (index, row) in rows.iter().enumerate() {
         let document = SearchDocument::for_row(row);
@@ -270,18 +324,16 @@ fn filter(rows: &[Row], query: &str, matcher: &mut Matcher) -> Vec<usize> {
             })
             .max();
         let Some(score) = score else { continue };
-        if matches!(row.kind, Kind::Open { .. }) {
-            open.push((score, index));
-        } else {
-            projects.push((score, index));
-        }
+        sections[section(&row.kind) as usize].push((score, index));
     }
 
     let rank = |a: &(u32, usize), b: &(u32, usize)| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1));
-    open.sort_by(rank);
-    projects.sort_by(rank);
-    open.into_iter()
-        .chain(projects)
+    for bucket in &mut sections {
+        bucket.sort_by(rank);
+    }
+    sections
+        .into_iter()
+        .flatten()
         .map(|(_, index)| index)
         .collect()
 }
@@ -362,6 +414,32 @@ fn pane_label(row: &Row) -> String {
     }
 }
 
+/// Compact, deduplicated summary of the workspace's tab labels.
+fn tab_summary(row: &Row) -> Option<String> {
+    let mut seen = HashSet::new();
+    let unique: Vec<&str> = row
+        .tab_names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| seen.insert(*name))
+        .collect();
+    match unique.as_slice() {
+        [] => None,
+        [only] => Some((*only).to_string()),
+        [first, second] => Some(format!("{first} · {second}")),
+        [first, second, rest @ ..] => Some(format!("{first} · {second} +{}", rest.len())),
+    }
+}
+
+/// Muted half of an open row: the collapsed path plus optional tab context.
+fn secondary_context(row: &Row) -> String {
+    match tab_summary(row) {
+        Some(tabs) if row.display.is_empty() => format!("tabs: {tabs}"),
+        Some(tabs) => format!("{} · tabs: {tabs}", row.display),
+        None => row.display.clone(),
+    }
+}
+
 fn body_spans(
     name: &str,
     path: &str,
@@ -388,60 +466,83 @@ fn body_spans(
 /// One row constrained to `width` terminal display columns. `number` is the
 /// Alt+digit quick-jump number (1-9, 0) shown in front of open rows; dormant
 /// rows pass `None`.
+/// One stateful row: optional Alt+digit prefix, state glyph, bold name, muted
+/// context, and agent/state meta on the right.
+fn stateful_line(
+    row: &Row,
+    width: usize,
+    number: Option<usize>,
+    state: AgentState,
+    agent: Option<&str>,
+    name: &str,
+) -> Line<'static> {
+    let number_prefix = number.map_or(String::new(), |digit| format!("{digit} "));
+    let number_width = display_width(&number_prefix);
+    let color = state_color(state);
+    let glyph = truncate_to_width(&format!("{} ", state.glyph()), width.min(GLYPH_W));
+    let glyph_width = display_width(&glyph);
+    let remaining = width.saturating_sub(number_width + glyph_width);
+
+    let full_meta = match agent {
+        Some(agent) => format!("{agent} · {}", state.word()),
+        None => state.word().to_string(),
+    };
+    let meta = if width >= 30 {
+        truncate_to_width(&full_meta, (width / 3).min(20))
+    } else {
+        String::new()
+    };
+    let meta_width = display_width(&meta);
+    let meta_gap = usize::from(!meta.is_empty() && remaining > meta_width);
+    let body_budget = remaining.saturating_sub(meta_width + meta_gap);
+    let mut body = body_spans(
+        name,
+        &secondary_context(row),
+        body_budget,
+        Style::default().fg(FG).add_modifier(Modifier::BOLD),
+        Style::default().fg(MUTED),
+    );
+    let body_width = spans_width(&body);
+    if body_width < body_budget {
+        body.push(Span::raw(" ".repeat(body_budget - body_width)));
+    }
+
+    let mut spans = Vec::new();
+    if !number_prefix.is_empty() {
+        spans.push(Span::styled(
+            number_prefix,
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(glyph, Style::default().fg(color)));
+    spans.extend(body);
+    if meta_gap > 0 {
+        spans.push(Span::raw(" "));
+    }
+    if !meta.is_empty() {
+        spans.push(Span::styled(meta, Style::default().fg(color)));
+    }
+    Line::from(truncate_spans(spans, width))
+}
+
 fn row_line(row: &Row, width: usize, number: Option<usize>) -> Line<'static> {
     if width == 0 {
         return Line::default();
     }
 
     match &row.kind {
-        Kind::Open { state, agent, .. } => {
-            let number_prefix = number.map_or(String::new(), |digit| format!("{digit} "));
-            let number_width = display_width(&number_prefix);
-            let color = state_color(*state);
-            let glyph = truncate_to_width(&format!("{} ", state.glyph()), width.min(GLYPH_W));
-            let glyph_width = display_width(&glyph);
-            let remaining = width.saturating_sub(number_width + glyph_width);
-
-            let full_meta = match agent {
-                Some(agent) => format!("{agent} · {}", state.word()),
-                None => state.word().to_string(),
-            };
-            let meta = if width >= 30 {
-                truncate_to_width(&full_meta, (width / 3).min(20))
-            } else {
-                String::new()
-            };
-            let meta_width = display_width(&meta);
-            let meta_gap = usize::from(!meta.is_empty() && remaining > meta_width);
-            let body_budget = remaining.saturating_sub(meta_width + meta_gap);
-            let mut body = body_spans(
-                &pane_label(row),
-                &row.display,
-                body_budget,
-                Style::default().fg(FG).add_modifier(Modifier::BOLD),
-                Style::default().fg(MUTED),
-            );
-            let body_width = spans_width(&body);
-            if body_width < body_budget {
-                body.push(Span::raw(" ".repeat(body_budget - body_width)));
-            }
-
-            let mut spans = Vec::new();
-            if !number_prefix.is_empty() {
-                spans.push(Span::styled(
-                    number_prefix,
-                    Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-                ));
-            }
-            spans.push(Span::styled(glyph, Style::default().fg(color)));
-            spans.extend(body);
-            if meta_gap > 0 {
-                spans.push(Span::raw(" "));
-            }
-            if !meta.is_empty() {
-                spans.push(Span::styled(meta, Style::default().fg(color)));
-            }
-            Line::from(truncate_spans(spans, width))
+        Kind::Open { state, agent, .. } => stateful_line(
+            row,
+            width,
+            number,
+            *state,
+            agent.as_deref(),
+            &pane_label(row),
+        ),
+        // Tabs and renamed panes are ordinary rows too; they just never carry
+        // an Alt+digit number because that numbering is workspace-only.
+        Kind::Tab { state, agent, .. } | Kind::Pane { state, agent, .. } => {
+            stateful_line(row, width, number, *state, agent.as_deref(), &row.name)
         }
         Kind::Dormant => {
             let glyph = " ".repeat(width.min(GLYPH_W));
@@ -482,21 +583,15 @@ fn build(
     let mut open_index = 0usize;
     for (filtered_index, row_index) in filtered.iter().copied().enumerate() {
         let row = &rows[row_index];
-        let group = if matches!(row.kind, Kind::Open { .. }) {
-            0u8
-        } else {
-            1u8
-        };
+        let group = section(&row.kind);
         if last_group != Some(group) {
-            items.push(header_item(
-                if group == 0 { "OPEN" } else { "PROJECTS" },
-                if group == 0 {
-                    "LIVE WORKSPACES"
-                } else {
-                    "NOT OPEN YET"
-                },
-                width,
-            ));
+            let (label, suffix) = match group {
+                0 => ("OPEN", "LIVE WORKSPACES"),
+                1 => ("TABS", "OPEN WORKSPACES"),
+                2 => ("PANES", "RENAMED"),
+                _ => ("PROJECTS", "NOT OPEN YET"),
+            };
+            items.push(header_item(label, suffix, width));
             last_group = Some(group);
         }
         if filtered_index == selected {
@@ -532,6 +627,13 @@ fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> 
     Line::from(truncate_spans(left, width))
 }
 
+fn enter_action(kind: &Kind) -> &'static str {
+    match kind {
+        Kind::Open { .. } | Kind::Tab { .. } | Kind::Pane { .. } => "focus",
+        Kind::Dormant => "open project",
+    }
+}
+
 fn keycap(key: &str, label: &str) -> Vec<Span<'static>> {
     vec![
         Span::styled(
@@ -542,11 +644,24 @@ fn keycap(key: &str, label: &str) -> Vec<Span<'static>> {
     ]
 }
 
-fn empty_item(loading: bool, error: Option<&str>, query: &str, width: usize) -> ListItem<'static> {
+fn empty_item(
+    loading: bool,
+    project_search_started: bool,
+    project_source_status: ProjectSourceStatus,
+    error: Option<&str>,
+    query: &str,
+    width: usize,
+) -> ListItem<'static> {
     let (message, color) = if loading {
         (
-            if query.is_empty() {
-                "Loading workspaces and projects…"
+            if project_search_started {
+                if query.is_empty() {
+                    "Searching projects…"
+                } else {
+                    "No matches yet — searching projects…"
+                }
+            } else if query.is_empty() {
+                "Loading workspaces…"
             } else {
                 "No matches yet — still loading…"
             },
@@ -554,10 +669,12 @@ fn empty_item(loading: bool, error: Option<&str>, query: &str, width: usize) -> 
         )
     } else if let Some(error) = error {
         (error, RED)
-    } else if query.is_empty() {
-        ("No projects configured", MUTED)
+    } else if !query.is_empty() {
+        ("No matching workspaces or projects", MUTED)
+    } else if project_source_status == ProjectSourceStatus::Unavailable {
+        ("No projects found; zoxide suggestions unavailable", MUTED)
     } else {
-        ("No matches", MUTED)
+        ("No projects found", MUTED)
     };
     ListItem::new(Line::from(vec![Span::styled(
         truncate_to_width(message, width),
@@ -578,6 +695,8 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
     };
     let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
     let mut loading = true;
+    let mut project_search_started = false;
+    let mut project_source_status = ProjectSourceStatus::Searching;
     let mut refresh_error: Option<String> = None;
     let mut live_workspace_ids = None;
     let mut origin_workspace = None;
@@ -589,6 +708,8 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
             while channel_open {
                 match updates.try_recv() {
                     Ok(RefreshMessage::Partial(snapshot)) => {
+                        project_source_status = snapshot.project_source_status;
+                        project_search_started = true;
                         live_workspace_ids = snapshot.live_workspace_ids.clone();
                         origin_workspace = snapshot.origin_workspace.clone();
                         state.apply_partial(snapshot, &mut matcher);
@@ -596,6 +717,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                         refresh_error = None;
                     }
                     Ok(RefreshMessage::Ready(snapshot)) => {
+                        project_source_status = snapshot.project_source_status;
                         live_workspace_ids = snapshot.live_workspace_ids.clone();
                         origin_workspace = snapshot.origin_workspace.clone();
                         state.apply_snapshot(snapshot, &mut matcher);
@@ -604,6 +726,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                     }
                     Ok(RefreshMessage::Failed(error)) => {
                         loading = false;
+                        project_search_started = false;
                         refresh_error = Some(format!("Refresh failed: {error}"));
                     }
                     Err(TryRecvError::Empty) => break,
@@ -611,6 +734,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                         channel_open = false;
                         if loading {
                             loading = false;
+                            project_search_started = false;
                             refresh_error = Some("Refresh stopped before completion".into());
                         }
                     }
@@ -626,7 +750,11 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                 .iter()
                 .filter(|row| matches!(row.kind, Kind::Open { .. }))
                 .count();
-            let dormant_count = state.rows.len() - open_count;
+            let project_count = state
+                .rows
+                .iter()
+                .filter(|row| matches!(row.kind, Kind::Dormant))
+                .count();
 
             terminal.draw(|frame| {
                 let area = frame.area();
@@ -638,12 +766,25 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                 let mut title_spans = vec![
                     Span::styled(format!(" {open_count} open"), Style::default().fg(GREEN)),
                     Span::styled(" · ", Style::default().fg(FAINT)),
-                    Span::styled(format!("{dormant_count} idle"), Style::default().fg(MUTED)),
+                    Span::styled(
+                        format!("{project_count} projects"),
+                        Style::default().fg(MUTED),
+                    ),
                 ];
                 if loading {
-                    title_spans.push(Span::styled(" · loading ", Style::default().fg(YELLOW)));
+                    let status = if project_search_started {
+                        " · searching projects "
+                    } else {
+                        " · loading workspaces "
+                    };
+                    title_spans.push(Span::styled(status, Style::default().fg(YELLOW)));
                 } else if refresh_error.is_some() {
                     title_spans.push(Span::styled(" · refresh failed ", Style::default().fg(RED)));
+                } else if project_source_status == ProjectSourceStatus::Unavailable {
+                    title_spans.push(Span::styled(
+                        " · zoxide unavailable ",
+                        Style::default().fg(YELLOW),
+                    ));
                 } else {
                     title_spans.push(Span::raw(" "));
                 }
@@ -699,6 +840,8 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                     (
                         vec![empty_item(
                             loading,
+                            project_search_started,
+                            project_source_status,
                             refresh_error.as_deref(),
                             &state.query,
                             list_width,
@@ -718,7 +861,9 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                 frame.render_stateful_widget(list, vertical[2], &mut list_state);
 
                 let mut footer = Vec::new();
-                footer.extend(keycap("↵", "jump/create"));
+                if let Some(row) = state.selected_row(&filtered) {
+                    footer.extend(keycap("↵", enter_action(&row.kind)));
+                }
                 footer.extend(keycap("⌥0-9", "recents"));
                 footer.extend(keycap("^n", "force new"));
                 footer.extend(keycap("^x", "close"));
@@ -763,8 +908,11 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                 }
                 KeyCode::Char('n') if control => {
                     if let Some(row) = state.selected_row(&filtered) {
-                        outcome = Outcome::ForceNew(row);
-                        break;
+                        // Force-new only means something for a directory row.
+                        if matches!(row.kind, Kind::Open { .. } | Kind::Dormant) {
+                            outcome = Outcome::ForceNew(row);
+                            break;
+                        }
                     }
                 }
                 KeyCode::Char('x') if control => {
@@ -830,6 +978,7 @@ mod tests {
             path: PathBuf::from(path),
             display: display.into(),
             pane_names: pane_names.iter().map(|name| (*name).into()).collect(),
+            tab_names: Vec::new(),
             kind: Kind::Open {
                 workspace_id: name.into(),
                 state: AgentState::Working,
@@ -838,14 +987,64 @@ mod tests {
         }
     }
 
+    fn open_with_tabs(
+        name: &str,
+        display: &str,
+        path: &str,
+        pane_names: &[&str],
+        tab_names: &[&str],
+    ) -> Row {
+        let mut row = open(name, display, path, pane_names);
+        row.tab_names = tab_names.iter().map(|name| (*name).into()).collect();
+        row
+    }
+
     fn project(name: &str, display: &str, path: &str) -> Row {
         Row {
             name: name.into(),
             path: PathBuf::from(path),
             display: display.into(),
             pane_names: Vec::new(),
+            tab_names: Vec::new(),
             kind: Kind::Dormant,
         }
+    }
+
+    #[test]
+    fn unnamed_pane_names_stay_searchable_on_the_workspace_row() {
+        let rows = vec![
+            open("workspace", "~/work", "/Users/me/work", &["shell"]),
+            open_with_tabs(
+                "labeled",
+                "~/labeled",
+                "/Users/me/labeled",
+                &[],
+                &["api server"],
+            ),
+        ];
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+
+        // Unnamed panes have no row of their own, so the workspace row keeps
+        // them searchable. Tab names are owned by tab rows instead.
+        assert_eq!(filter(&rows, "shell", &mut matcher), vec![0]);
+        assert!(filter(&rows, "api server", &mut matcher).is_empty());
+    }
+
+    #[test]
+    fn open_row_shows_tab_names_only_when_present() {
+        let labeled = open_with_tabs(
+            "workspace",
+            "~/work",
+            "/Users/me/work",
+            &["editor"],
+            &["api server", "logs"],
+        );
+        let line = row_line(&labeled, 120, None).to_string();
+        assert!(line.contains("tabs: api server · logs"), "{line}");
+
+        let plain = open("workspace", "~/work", "/Users/me/work", &["editor"]);
+        let line = row_line(&plain, 120, None).to_string();
+        assert!(!line.contains("tabs:"), "{line}");
     }
 
     #[test]
@@ -910,6 +1109,7 @@ mod tests {
                 open("two", "~/two", "/two", &[]),
                 open("one", "~/one", "/one", &[]),
             ],
+            project_source_status: ProjectSourceStatus::Available,
             live_workspace_ids: Some(HashSet::new()),
             origin_workspace: None,
         };
@@ -938,7 +1138,9 @@ mod tests {
         state.apply_partial(
             Snapshot {
                 rows: vec![open("open", "~/open", "/open", &[])],
+                project_source_status: ProjectSourceStatus::Searching,
                 live_workspace_ids: Some(HashSet::from(["open".into()])),
+
                 origin_workspace: None,
             },
             &mut matcher,
@@ -1092,5 +1294,179 @@ mod tests {
         assert_eq!(nth_open_jump(&mut state, &filtered, 2).unwrap().name, "one");
         assert_eq!(state.selected, 2);
         assert!(nth_open_jump(&mut state, &filtered, 99).is_none());
+    }
+
+    fn tab_row(name: &str, workspace: &str, tab_id: &str, display: &str) -> Row {
+        Row {
+            name: name.into(),
+            path: PathBuf::from("/Users/me/work"),
+            display: display.into(),
+            pane_names: Vec::new(),
+            tab_names: Vec::new(),
+            kind: Kind::Tab {
+                workspace_id: workspace.into(),
+                tab_id: tab_id.into(),
+                state: AgentState::Working,
+                agent: Some("claude".into()),
+            },
+        }
+    }
+
+    fn pane_row(name: &str, workspace: &str, pane_id: &str, display: &str) -> Row {
+        Row {
+            name: name.into(),
+            path: PathBuf::from("/Users/me/work"),
+            display: display.into(),
+            pane_names: Vec::new(),
+            tab_names: Vec::new(),
+            kind: Kind::Pane {
+                workspace_id: workspace.into(),
+                tab_id: Some("w1:t1".into()),
+                pane_id: pane_id.into(),
+                state: AgentState::Idle,
+                agent: None,
+            },
+        }
+    }
+
+    #[test]
+    fn tab_and_pane_rows_are_searchable_in_their_own_sections() {
+        let rows = vec![
+            open("workspace", "~/work", "/Users/me/work", &["shell"]),
+            tab_row("api server", "w1", "w1:t2", "~/work · w1:t2"),
+            pane_row("editor", "w1", "w1:p1", "~/work · w1:p1"),
+            project("dormant", "~/dormant", "/Users/me/dormant"),
+        ];
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+
+        // Empty query keeps section order: workspaces, tabs, panes, projects.
+        assert_eq!(filter(&rows, "", &mut matcher), vec![0, 1, 2, 3]);
+        assert_eq!(filter(&rows, "api server", &mut matcher), vec![1]);
+        assert_eq!(filter(&rows, "editor", &mut matcher), vec![2]);
+        assert_eq!(filter(&rows, "w1:t2", &mut matcher), vec![1]);
+        assert_eq!(filter(&rows, "w1:p1", &mut matcher), vec![2]);
+        assert_eq!(filter(&rows, "dormant", &mut matcher), vec![3]);
+    }
+
+    #[test]
+    fn tab_and_pane_rows_render_like_rows_without_quick_jump_numbers() {
+        let tab = tab_row("api server", "w1", "w1:t2", "~/work · w1:t2");
+        let text = row_line(&tab, 120, None).to_string();
+        assert!(text.contains("api server"), "{text}");
+        assert!(text.contains("w1:t2"), "{text}");
+        assert!(!text.starts_with("1 "), "{text}");
+
+        let pane = pane_row("editor", "w1", "w1:p1", "~/work · w1:p1");
+        let text = row_line(&pane, 120, None).to_string();
+        assert!(text.contains("editor"), "{text}");
+        assert!(text.contains("w1:p1"), "{text}");
+    }
+
+    #[test]
+    fn build_adds_headers_for_every_section() {
+        let rows = vec![
+            open("workspace", "~/work", "/Users/me/work", &["shell"]),
+            tab_row("api server", "w1", "w1:t2", "~/work · w1:t2"),
+            pane_row("editor", "w1", "w1:p1", "~/work · w1:p1"),
+            project("dormant", "~/dormant", "/Users/me/dormant"),
+        ];
+        let filtered: Vec<usize> = (0..rows.len()).collect();
+        let (items, selected_position) = build(&rows, &filtered, 0, 100);
+
+        // Four sections, so four headers plus one item per row.
+        assert_eq!(items.len(), rows.len() + 4);
+        assert_eq!(selected_position, 1);
+        let debug: Vec<String> = items.iter().map(|item| format!("{item:?}")).collect();
+        assert!(debug[0].contains("OPEN"), "{}", debug[0]);
+        assert!(debug[2].contains("TABS"), "{}", debug[2]);
+        assert!(debug[4].contains("PANES"), "{}", debug[4]);
+        assert!(debug[6].contains("PROJECTS"), "{}", debug[6]);
+    }
+
+    #[test]
+    fn open_workspace_paths_excludes_tabs_panes_and_dormant_projects() {
+        let state = PickerState {
+            rows: vec![
+                open("w1", "~/work", "/work", &[]),
+                tab_row("api", "w1", "w1:t1", "~/work"),
+                pane_row("editor", "w1", "w1:p1", "~/work"),
+                project("other", "~/other", "/other"),
+            ],
+            query: String::new(),
+            selected: 0,
+        };
+
+        assert_eq!(
+            state.open_workspace_paths().collect::<Vec<_>>(),
+            vec![std::path::Path::new("/work")]
+        );
+    }
+
+    #[test]
+    fn enter_action_distinguishes_focus_from_opening_a_project() {
+        let workspace = open("w1", "~/work", "/work", &[]);
+        let tab = tab_row("api", "w1", "w1:t1", "~/work");
+        let pane = pane_row("editor", "w1", "w1:p1", "~/work");
+        let project = project("other", "~/other", "/other");
+
+        assert_eq!(enter_action(&workspace.kind), "focus");
+        assert_eq!(enter_action(&tab.kind), "focus");
+        assert_eq!(enter_action(&pane.kind), "focus");
+        assert_eq!(enter_action(&project.kind), "open project");
+    }
+
+    #[test]
+    fn empty_picker_messages_explain_project_discovery_state() {
+        let searching = format!(
+            "{:?}",
+            empty_item(true, true, ProjectSourceStatus::Searching, None, "", 80)
+        );
+        assert!(searching.contains("Searching projects"), "{searching}");
+
+        let unavailable = format!(
+            "{:?}",
+            empty_item(false, false, ProjectSourceStatus::Unavailable, None, "", 80)
+        );
+        assert!(
+            unavailable.contains("zoxide suggestions unavailable"),
+            "{unavailable}"
+        );
+
+        let no_matches = format!(
+            "{:?}",
+            empty_item(
+                false,
+                false,
+                ProjectSourceStatus::Available,
+                None,
+                "missing",
+                80
+            )
+        );
+        assert!(
+            no_matches.contains("No matching workspaces or projects"),
+            "{no_matches}"
+        );
+    }
+
+    #[test]
+    fn alt_digit_quick_jump_ignores_tab_and_pane_rows() {
+        let mut state = PickerState {
+            rows: vec![
+                open("one", "~/one", "/one", &[]),
+                tab_row("api server", "w1", "w1:t1", "~/one · w1:t1"),
+                pane_row("editor", "w1", "w1:p1", "~/one · w1:p1"),
+                open("two", "~/two", "/two", &[]),
+            ],
+            query: String::new(),
+            selected: 0,
+        };
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+        let filtered = state.filtered(&mut matcher);
+
+        assert_eq!(filtered, vec![0, 3, 1, 2]);
+        assert_eq!(nth_open_jump(&mut state, &filtered, 0).unwrap().name, "one");
+        assert_eq!(nth_open_jump(&mut state, &filtered, 1).unwrap().name, "two");
+        assert!(nth_open_jump(&mut state, &filtered, 2).is_none());
     }
 }

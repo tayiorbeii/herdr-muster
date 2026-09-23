@@ -14,6 +14,10 @@ pub struct Registry {
     /// picker was opened from and Down+Enter reaches the one before it.
     #[serde(default)]
     mru: Vec<String>,
+    /// Previously opened project directories, newest first. Unlike bindings,
+    /// history survives workspace closure and reconciliation.
+    #[serde(default)]
+    recent_projects: Vec<String>,
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -67,9 +71,24 @@ impl Registry {
         for (directory, workspace) in entries {
             map.entry(key(Path::new(&directory))).or_insert(workspace);
         }
+        let mut recent_projects = Vec::new();
+        for directory in registry
+            .recent_projects
+            .into_iter()
+            .chain(map.keys().cloned())
+        {
+            let directory = key(Path::new(&directory));
+            if !recent_projects.contains(&directory) {
+                recent_projects.push(directory);
+            }
+            if recent_projects.len() == 100 {
+                break;
+            }
+        }
         Registry {
             map,
             mru: registry.mru,
+            recent_projects,
         }
     }
 
@@ -97,7 +116,27 @@ impl Registry {
     }
 
     pub fn bind(&mut self, directory: &Path, workspace: &str) {
-        self.map.insert(key(directory), workspace.to_string());
+        let directory = key(directory);
+        self.map.insert(directory.clone(), workspace.to_string());
+        self.remember_project(Path::new(&directory));
+    }
+
+    /// Record a project seen in Herdr, retaining it independently of a live
+    /// workspace binding. Returns whether the MRU history changed.
+    pub fn remember_project(&mut self, directory: &Path) -> bool {
+        let directory = key(directory);
+        if self.recent_projects.first() == Some(&directory) {
+            return false;
+        }
+        self.recent_projects.retain(|recent| recent != &directory);
+        self.recent_projects.insert(0, directory);
+        self.recent_projects.truncate(100);
+        true
+    }
+
+    /// Previously opened directories, newest first, including closed workspaces.
+    pub fn recent_projects(&self) -> Vec<PathBuf> {
+        self.recent_projects.iter().map(PathBuf::from).collect()
     }
 
     /// Remove a binding only if it still identifies the workspace being closed.
@@ -171,6 +210,41 @@ mod tests {
     }
 
     #[test]
+    fn project_history_survives_close_and_reconcile_and_tracks_reopens() {
+        let mut registry = Registry::default();
+        registry.bind(Path::new("/a"), "w1");
+        registry.bind(Path::new("/b"), "w2");
+        assert_eq!(
+            registry.recent_projects(),
+            vec![PathBuf::from("/b"), PathBuf::from("/a")]
+        );
+
+        assert!(registry.unbind_if_bound(Path::new("/b"), "w2"));
+        assert!(registry.reconcile(&HashSet::new()));
+        assert_eq!(
+            registry.recent_projects(),
+            vec![PathBuf::from("/b"), PathBuf::from("/a")]
+        );
+
+        registry.remember_project(Path::new("/a"));
+        assert_eq!(
+            registry.recent_projects(),
+            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+        );
+    }
+
+    #[test]
+    fn old_registry_bindings_seed_project_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.json");
+        fs::write(&path, r#"{"map":{"/legacy":"w1"},"mru":[]}"#).unwrap();
+
+        let registry = Registry::load(&path);
+
+        assert_eq!(registry.recent_projects(), vec![PathBuf::from("/legacy")]);
+    }
+
+    #[test]
     fn reconcile_drops_dead() {
         let mut registry = Registry::default();
         registry.bind(Path::new("/a"), "w1");
@@ -220,6 +294,7 @@ mod tests {
             Some("w1")
         );
         assert_eq!(loaded.mru(), &["w1".to_string()]);
+        assert_eq!(loaded.recent_projects(), vec![PathBuf::from("/a")]);
         assert!(loaded.workspace_for(Path::new("/old")).is_none());
         assert!(fs::read_dir(path.parent().unwrap())
             .unwrap()

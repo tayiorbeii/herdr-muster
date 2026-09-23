@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::herdr::{command_output, CliHerdr, Herdr, Pane, Workspace};
+use crate::herdr::{command_output, CliHerdr, Herdr, Pane, TabInfo, Workspace};
 use crate::model::{self, Row};
 use crate::sources;
 use std::collections::{HashMap, HashSet};
@@ -44,9 +44,19 @@ impl Drop for Updates {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectSourceStatus {
+    Searching,
+    Available,
+    Unavailable,
+    Disabled,
+}
+
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub rows: Vec<Row>,
+    /// Availability of the optional zoxide project source.
+    pub project_source_status: ProjectSourceStatus,
     /// `None` means the workspace query failed, so callers must not reconcile
     /// persisted bindings against this incomplete snapshot.
     pub live_workspace_ids: Option<HashSet<String>>,
@@ -68,6 +78,7 @@ pub enum Message {
 struct HerdrData {
     workspaces: Vec<Workspace>,
     panes: Vec<Pane>,
+    tabs: Vec<TabInfo>,
     live_workspace_ids: Option<HashSet<String>>,
 }
 
@@ -81,11 +92,20 @@ fn load_herdr<H: Herdr>(client: &H) -> crate::herdr::Result<HerdrData> {
             return Ok(HerdrData {
                 workspaces: Vec::new(),
                 panes: Vec::new(),
+                tabs: Vec::new(),
                 live_workspace_ids: None,
             });
         }
     };
     let panes = client.list_panes()?;
+    // Tab labels are optional enrichment: a missing or failing `tab list`
+    // degrades to rows without tab context and never fails the snapshot. The
+    // extra call is skipped entirely when there are no panes.
+    let tabs = if panes.is_empty() {
+        Vec::new()
+    } else {
+        client.list_tabs().unwrap_or_default()
+    };
     let live_workspace_ids = workspaces
         .iter()
         .map(|workspace| workspace.workspace_id.clone())
@@ -93,32 +113,40 @@ fn load_herdr<H: Herdr>(client: &H) -> crate::herdr::Result<HerdrData> {
     Ok(HerdrData {
         workspaces,
         panes,
+        tabs,
         live_workspace_ids: Some(live_workspace_ids),
     })
 }
 
-fn zoxide_lines(enabled: bool, cancellation: &AtomicBool) -> Vec<String> {
-    if !enabled || cancellation.load(Ordering::Relaxed) {
-        return Vec::new();
+fn zoxide_lines(enabled: bool, cancellation: &AtomicBool) -> (Vec<String>, ProjectSourceStatus) {
+    if !enabled {
+        return (Vec::new(), ProjectSourceStatus::Disabled);
+    }
+    if cancellation.load(Ordering::Relaxed) {
+        return (Vec::new(), ProjectSourceStatus::Searching);
     }
     let mut command = Command::new("zoxide");
     command.args(["query", "-l"]);
     let Ok(output) = command_output(&mut command, "zoxide query -l", Some(cancellation)) else {
-        return Vec::new();
+        return (Vec::new(), ProjectSourceStatus::Unavailable);
     };
     if !output.status.success() {
-        return Vec::new();
+        return (Vec::new(), ProjectSourceStatus::Unavailable);
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::to_string)
-        .collect()
+    (
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect(),
+        ProjectSourceStatus::Available,
+    )
 }
 
 pub fn spawn(
     client: CliHerdr,
     config_path: PathBuf,
     bound: HashMap<PathBuf, String>,
+    recent_projects: Vec<PathBuf>,
     mru: Vec<String>,
     origin_pane_id: Option<String>,
 ) -> Updates {
@@ -159,12 +187,14 @@ pub fn spawn(
             &bound,
             &data.workspaces,
             &data.panes,
+            &data.tabs,
             &[],
             &mru,
             origin_workspace.as_deref(),
         );
         let partial = Snapshot {
             rows: open_rows,
+            project_source_status: ProjectSourceStatus::Searching,
             live_workspace_ids: data.live_workspace_ids.clone(),
             origin_workspace: origin_workspace.clone(),
         };
@@ -172,9 +202,12 @@ pub fn spawn(
             return;
         }
 
-        let Some(projects) = sources::gather(
+        let (zoxide_candidates, project_source_status) =
+            zoxide_lines(config.use_zoxide, &worker_cancellation);
+        let Some(projects) = sources::gather_with_recent(
             &config,
-            &zoxide_lines(config.use_zoxide, &worker_cancellation),
+            &zoxide_candidates,
+            &recent_projects,
             &worker_cancellation,
         ) else {
             return;
@@ -186,12 +219,14 @@ pub fn spawn(
             &bound,
             &data.workspaces,
             &data.panes,
+            &data.tabs,
             &projects,
             &mru,
             origin_workspace.as_deref(),
         );
         let _ = sender.send(Message::Ready(Snapshot {
             rows,
+            project_source_status,
             live_workspace_ids: data.live_workspace_ids,
             origin_workspace,
         }));
@@ -211,6 +246,7 @@ mod tests {
     struct FakeHerdr {
         fail_workspaces: bool,
         fail_panes: bool,
+        fail_tabs: bool,
     }
 
     impl Herdr for FakeHerdr {
@@ -233,10 +269,33 @@ mod tests {
                 Ok(vec![Pane {
                     pane_id: "w1:p1".into(),
                     workspace_id: "w1".into(),
+                    tab_id: None,
                     cwd: Some("/api".into()),
+                    foreground_cwd: None,
                     agent: None,
+                    agent_status: None,
                     label: Some("editor".into()),
+                    title: None,
                     terminal_title: None,
+                    focused: false,
+                    hidden: false,
+                    plugin: false,
+                    floating: false,
+                    suppressed: false,
+                }])
+            }
+        }
+
+        fn list_tabs(&self) -> Result<Vec<TabInfo>> {
+            if self.fail_tabs {
+                Err(HerdrError::Command("tab failure".into()))
+            } else {
+                Ok(vec![TabInfo {
+                    tab_id: "w1:t1".into(),
+                    workspace_id: "w1".into(),
+                    label: Some("api tab".into()),
+                    number: None,
+                    agent_status: None,
                 }])
             }
         }
@@ -263,6 +322,7 @@ mod tests {
         let data = load_herdr(&FakeHerdr {
             fail_workspaces: false,
             fail_panes: false,
+            fail_tabs: false,
         })
         .unwrap();
         assert_eq!(data.live_workspace_ids, Some(HashSet::from(["w1".into()])));
@@ -274,6 +334,7 @@ mod tests {
         let data = load_herdr(&FakeHerdr {
             fail_workspaces: true,
             fail_panes: false,
+            fail_tabs: false,
         })
         .unwrap();
 
@@ -288,6 +349,7 @@ mod tests {
             &HashMap::new(),
             &data.workspaces,
             &data.panes,
+            &data.tabs,
             &projects,
             &[],
             None,
@@ -300,6 +362,7 @@ mod tests {
         let error = load_herdr(&FakeHerdr {
             fail_workspaces: false,
             fail_panes: true,
+            fail_tabs: false,
         })
         .unwrap_err();
         assert!(error.to_string().contains("pane failure"));
@@ -359,6 +422,7 @@ esac
             client,
             config_path,
             HashMap::new(),
+            Vec::new(),
             mru,
             Some("w2:p9".into()),
         );
@@ -381,5 +445,89 @@ esac
                 Err(TryRecvError::Disconnected) => panic!("refresh worker disconnected"),
             }
         }
+    }
+
+    #[test]
+    fn tab_list_is_loaded_into_snapshot_data() {
+        let data = load_herdr(&FakeHerdr {
+            fail_workspaces: false,
+            fail_panes: false,
+            fail_tabs: false,
+        })
+        .unwrap();
+
+        assert_eq!(data.tabs.len(), 1);
+        assert_eq!(data.tabs[0].label.as_deref(), Some("api tab"));
+    }
+
+    #[test]
+    fn tab_list_failure_degrades_to_rows_without_tab_names() {
+        let data = load_herdr(&FakeHerdr {
+            fail_workspaces: false,
+            fail_panes: false,
+            fail_tabs: true,
+        })
+        .unwrap();
+
+        assert!(data.tabs.is_empty());
+        let rows = model::assemble(
+            &HashMap::new(),
+            &data.workspaces,
+            &data.panes,
+            &data.tabs,
+            &[],
+            &[],
+            None,
+        );
+        // The workspace row and the renamed-pane row both survive without tabs.
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.tab_names.is_empty()));
+        assert!(rows[0].pane_names.is_empty());
+        assert!(matches!(rows[1].kind, model::Kind::Pane { .. }));
+    }
+
+    /// A runtime with no panes must not pay for the extra tab call at all.
+    struct NoPaneHerdr;
+
+    impl Herdr for NoPaneHerdr {
+        fn list_workspaces(&self) -> Result<Vec<Workspace>> {
+            Ok(vec![Workspace {
+                workspace_id: "w1".into(),
+                label: "api".into(),
+                agent_status: "idle".into(),
+            }])
+        }
+
+        fn list_panes(&self) -> Result<Vec<Pane>> {
+            Ok(Vec::new())
+        }
+
+        fn list_tabs(&self) -> Result<Vec<TabInfo>> {
+            unreachable!("tab list must be skipped when there are no panes")
+        }
+
+        fn create_workspace(&self, _cwd: &str, _label: &str) -> Result<String> {
+            unreachable!()
+        }
+
+        fn focus_workspace(&self, _id: &str) -> Result<()> {
+            unreachable!()
+        }
+
+        fn close_workspace(&self, _id: &str) -> Result<()> {
+            unreachable!()
+        }
+
+        fn close_pane(&self, _id: &str) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn empty_pane_list_skips_the_tab_call() {
+        let data = load_herdr(&NoPaneHerdr).unwrap();
+
+        assert!(data.panes.is_empty());
+        assert!(data.tabs.is_empty());
     }
 }

@@ -3,3 +3,19 @@
 paths      = ["~/dev/api", "~/notes"]
 roots      = ["~/dev"]
 use_zoxide = true
+
+# Optional named live Herdr sessions. Each result is qualified and routed
+# through its own socket; failed sessions do not affect the default runtime.
+# Explicit sockets are required for exact focus on configured targets.
+# [[jump_pane.sessions]]
+# name = "work"
+# socket = "~/.config/herdr/work.sock"
+# command = "herdr"
+# args = []
+# For remote enumeration, configure a forwarded Unix socket too:
+# [[jump_pane.sessions]]
+# name = "remote"
+# remote = "host.example"
+# socket = "~/.config/herdr/remote.sock"
+# Optional filters can scope a session: filter = { host = ["host.example"] }
+# The default local target uses ~/.config/herdr/herdr.sock automatically.

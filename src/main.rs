@@ -1,5 +1,6 @@
 mod config;
 mod herdr;
+mod jump_pane;
 mod model;
 mod picker;
 mod refresh;
@@ -46,7 +47,53 @@ fn reconcile_after_refresh(
     live_workspace_ids.is_some_and(|live| registry.reconcile(live))
 }
 
+fn should_cleanup_launcher(launcher: &str, selected: Option<&str>, origin: Option<&str>) -> bool {
+    Some(launcher) != selected && Some(launcher) != origin
+}
+
+fn run_jump_pane() -> Result<(), String> {
+    let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
+    let config = config::load_jump_pane_config(&config_path())?;
+    let clients: Vec<_> = jump_pane::targets(&config, &bin)
+        .into_iter()
+        .map(|target| {
+            let client = herdr::CliHerdr::new(target.command.clone())
+                .with_arg_prefix(target.arg_prefix.clone());
+            let client = target.socket.as_deref().map_or_else(
+                || {
+                    if target.focus_supported {
+                        client.clone()
+                    } else {
+                        client.without_default_socket()
+                    }
+                },
+                |socket| client.with_socket(socket),
+            );
+            (client, target)
+        })
+        .collect();
+    let state_path = std::env::var("HERDR_PLUGIN_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let state = jump_pane::JumpPaneState {
+        recency: jump_pane::load_recency(&state_path.join("jump-pane-state-v1.json")).0,
+        ..Default::default()
+    };
+    match jump_pane::run_interactive(state, &clients) {
+        Ok(jump_pane::FocusResult::Focused) => Ok(()),
+        Ok(jump_pane::FocusResult::Stale(message)) if message == "cancelled" => Ok(()),
+        Ok(result) => Err(format!("Jump Pane: {result:?}")),
+        Err(error) => Err(format!("Jump Pane: {error}")),
+    }
+}
+
 fn run() -> Result<(), String> {
+    if std::env::args().any(|arg| arg == "--jump-pane") {
+        // Jump Pane is an existing-pane action. It never closes its launcher:
+        // the launcher may itself be the selected pane, and closing it would
+        // destroy the pane just focused by the user.
+        return run_jump_pane();
+    }
     let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string());
     let client = herdr::CliHerdr::new(bin);
     let config_path = config_path();
@@ -62,6 +109,7 @@ fn run() -> Result<(), String> {
                 client.clone(),
                 config_path.clone(),
                 registry.live_map(),
+                registry.recent_projects(),
                 registry.mru().to_vec(),
                 origin_pane.clone(),
             );
@@ -74,6 +122,13 @@ fn run() -> Result<(), String> {
                 origin_workspace,
             } = session;
 
+            if live_workspace_ids.is_some() {
+                for path in state.open_workspace_paths() {
+                    if path.is_absolute() {
+                        dirty |= registry.remember_project(path);
+                    }
+                }
+            }
             if reconcile_after_refresh(&mut registry, live_workspace_ids.as_ref()) {
                 dirty = true;
             }
@@ -93,6 +148,26 @@ fn run() -> Result<(), String> {
                                 .map_err(|error| error.to_string())?;
                             dirty |= registry.touch(workspace_id);
                         }
+                        Kind::Tab {
+                            workspace_id,
+                            tab_id,
+                            ..
+                        } => {
+                            client
+                                .focus_tab(tab_id)
+                                .map_err(|error| error.to_string())?;
+                            dirty |= registry.touch(workspace_id);
+                        }
+                        Kind::Pane {
+                            workspace_id,
+                            pane_id,
+                            ..
+                        } => {
+                            client
+                                .focus_pane(pane_id)
+                                .map_err(|error| error.to_string())?;
+                            dirty |= registry.touch(workspace_id);
+                        }
                         Kind::Dormant => {
                             let id = create_and_bind(&client, &mut registry, &row.path)?;
                             dirty = true;
@@ -102,9 +177,13 @@ fn run() -> Result<(), String> {
                     return Ok(());
                 }
                 picker::Outcome::ForceNew(row) => {
-                    let id = create_and_bind(&client, &mut registry, &row.path)?;
-                    dirty = true;
-                    registry.touch(&id);
+                    // Only a directory row can be forced into a new workspace;
+                    // the picker never emits this for tabs or renamed panes.
+                    if matches!(row.kind, Kind::Open { .. } | Kind::Dormant) {
+                        let id = create_and_bind(&client, &mut registry, &row.path)?;
+                        dirty = true;
+                        registry.touch(&id);
+                    }
                     return Ok(());
                 }
                 picker::Outcome::Close(row) => {
@@ -113,6 +192,9 @@ fn run() -> Result<(), String> {
                         client
                             .close_workspace(workspace_id)
                             .map_err(|error| error.to_string())?;
+                        if row.path.is_absolute() {
+                            dirty |= registry.remember_project(&row.path);
+                        }
                         dirty |= registry.unbind_if_bound(&row.path, workspace_id);
                         dirty |= registry.forget(workspace_id);
                     }
@@ -133,13 +215,19 @@ fn run() -> Result<(), String> {
             }
         }
     }
-    if let Ok(pane) = std::env::var("HERDR_PANE_ID") {
-        if let Err(error) = client.close_pane(&pane) {
-            let close_error = format!("close picker pane {pane}: {error}");
-            if result.is_ok() {
-                result = Err(close_error);
-            } else {
-                eprintln!("herdr-muster: {close_error}");
+    if let Ok(pane) = std::env::var("HERDR_LAUNCHER_PANE_ID") {
+        // HERDR_PANE_ID is the selected/origin identity, not an implicit
+        // cleanup target. Cleanup is opt-in via the distinct launcher id.
+        let selected_origin = std::env::var("HERDR_SELECTED_PANE_ID").ok();
+        let origin = std::env::var("HERDR_PANE_ID").ok();
+        if should_cleanup_launcher(&pane, selected_origin.as_deref(), origin.as_deref()) {
+            if let Err(error) = client.close_pane(&pane) {
+                let close_error = format!("close picker pane {pane}: {error}");
+                if result.is_ok() {
+                    result = Err(close_error);
+                } else {
+                    eprintln!("herdr-muster: {close_error}");
+                }
             }
         }
     }
@@ -169,6 +257,17 @@ mod tests {
                 .map(String::as_str),
             Some("w1")
         );
+    }
+
+    #[test]
+    fn launcher_cleanup_never_closes_selected_origin() {
+        assert!(!should_cleanup_launcher("pane-1", Some("pane-1"), None));
+        assert!(!should_cleanup_launcher("pane-1", None, Some("pane-1")));
+        assert!(should_cleanup_launcher(
+            "launcher",
+            Some("selected"),
+            Some("origin")
+        ));
     }
 
     #[test]

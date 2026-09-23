@@ -1,8 +1,8 @@
 use serde::Deserialize;
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, BufRead, Read, Write};
 #[cfg(unix)]
-use std::os::unix::{io::AsRawFd, process::CommandExt};
+use std::os::unix::{io::AsRawFd, net::UnixStream, process::CommandExt};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -43,18 +43,39 @@ pub struct Workspace {
     pub agent_status: String,
 }
 
+/// A tab inside a workspace. Used only to enrich pane rows with a human-readable
+/// tab name for search and display; it is never part of pane identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabInfo {
+    pub tab_id: String,
+    pub workspace_id: String,
+    pub label: Option<String>,
+    /// Herdr's positional tab number; a label equal to it means "never renamed".
+    pub number: Option<usize>,
+    pub agent_status: Option<String>,
+}
+
 /// A live pane. Carries the directory identity for its workspace when muster
 /// did not create it (root-pane cwd), plus any detected agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pane {
     pub pane_id: String,
     pub workspace_id: String,
+    pub tab_id: Option<String>,
     pub cwd: Option<String>,
+    pub foreground_cwd: Option<String>,
     pub agent: Option<String>,
+    pub agent_status: Option<String>,
     /// User-assigned pane name (`herdr pane rename`), when present.
     pub label: Option<String>,
+    pub title: Option<String>,
     /// Terminal title is a useful fallback when a pane has no explicit label.
     pub terminal_title: Option<String>,
+    pub focused: bool,
+    pub hidden: bool,
+    pub plugin: bool,
+    pub floating: bool,
+    pub suppressed: bool,
 }
 
 impl Pane {
@@ -76,6 +97,32 @@ impl Pane {
 pub trait Herdr {
     fn list_workspaces(&self) -> Result<Vec<Workspace>>;
     fn list_panes(&self) -> Result<Vec<Pane>>;
+    /// List tabs for this runtime. Optional capability: runtimes that do not
+    /// support it return an empty list so pane navigation is unaffected.
+    fn list_tabs(&self) -> Result<Vec<TabInfo>> {
+        Ok(Vec::new())
+    }
+    /// Focus an existing tab by absolute identity. Optional capability, like
+    /// `focus_pane`: runtimes without a socket refuse instead of misrouting.
+    fn focus_tab(&self, _id: &str) -> Result<()> {
+        Err(HerdrError::Command(
+            "absolute tab focus is unavailable".into(),
+        ))
+    }
+    /// Focus an existing pane by absolute identity. This is deliberately not
+    /// implemented in terms of directional or workspace focus.
+    fn focus_pane(&self, _id: &str) -> Result<()> {
+        Err(HerdrError::Command(
+            "absolute pane focus is unavailable".into(),
+        ))
+    }
+    /// Return only a safe foreground process name, when the runtime supports it.
+    #[allow(dead_code)]
+    fn process_name(&self, _id: &str) -> Result<Option<String>> {
+        Err(HerdrError::Command(
+            "pane process info is unavailable".into(),
+        ))
+    }
     fn create_workspace(&self, cwd: &str, label: &str) -> Result<String>;
     fn focus_workspace(&self, id: &str) -> Result<()>;
     fn close_workspace(&self, id: &str) -> Result<()>;
@@ -114,13 +161,52 @@ struct PnItem {
     pane_id: String,
     workspace_id: String,
     #[serde(default)]
+    tab_id: Option<String>,
+    #[serde(default)]
     cwd: Option<String>,
+    #[serde(default)]
+    foreground_cwd: Option<String>,
     #[serde(default)]
     agent: Option<String>,
     #[serde(default)]
+    agent_status: Option<String>,
+    #[serde(default)]
     label: Option<String>,
     #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
     terminal_title_stripped: Option<String>,
+    #[serde(default)]
+    focused: bool,
+    #[serde(default)]
+    hidden: bool,
+    #[serde(default)]
+    plugin: bool,
+    #[serde(default)]
+    floating: bool,
+    #[serde(default)]
+    suppressed: bool,
+}
+
+#[derive(Deserialize)]
+struct TbResp {
+    result: TbResult,
+}
+#[derive(Deserialize)]
+struct TbResult {
+    tabs: Vec<TbItem>,
+}
+#[derive(Deserialize)]
+struct TbItem {
+    tab_id: String,
+    #[serde(default)]
+    workspace_id: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    number: Option<usize>,
+    #[serde(default)]
+    agent_status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -207,6 +293,28 @@ pub fn parse_created_id(json: &str) -> Result<String> {
     Ok(response.result.workspace.workspace_id)
 }
 
+/// Extract only the safe process `name` field. Arguments, environment and
+/// command lines are intentionally ignored even when returned by Herdr.
+#[allow(dead_code)]
+pub fn parse_process_name(json: &str) -> Result<Option<String>> {
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| HerdrError::InvalidJson(format!("invalid pane process-info JSON: {e}")))?;
+    let processes = value
+        .pointer("/result/processes")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| {
+            value
+                .pointer("/processes")
+                .and_then(serde_json::Value::as_array)
+        });
+    Ok(processes.and_then(|items| items.first()).and_then(|item| {
+        item.get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(sanitize_text)
+            .filter(|s| !s.trim().is_empty())
+    }))
+}
+
 pub fn parse_panes(json: &str) -> Result<Vec<Pane>> {
     let response: PnResp = serde_json::from_str(json)
         .map_err(|error| HerdrError::InvalidJson(format!("invalid pane list JSON: {error}")))?;
@@ -217,10 +325,36 @@ pub fn parse_panes(json: &str) -> Result<Vec<Pane>> {
         .map(|pane| Pane {
             pane_id: pane.pane_id,
             workspace_id: pane.workspace_id,
+            tab_id: clean(pane.tab_id),
             cwd: clean(pane.cwd),
+            foreground_cwd: clean(pane.foreground_cwd),
             agent: clean(pane.agent),
+            agent_status: clean(pane.agent_status),
             label: clean(pane.label),
+            title: clean(pane.title),
             terminal_title: clean(pane.terminal_title_stripped),
+            focused: pane.focused,
+            hidden: pane.hidden,
+            plugin: pane.plugin,
+            floating: pane.floating,
+            suppressed: pane.suppressed,
+        })
+        .collect())
+}
+
+pub fn parse_tabs(json: &str) -> Result<Vec<TabInfo>> {
+    let response: TbResp = serde_json::from_str(json)
+        .map_err(|error| HerdrError::InvalidJson(format!("invalid tab list JSON: {error}")))?;
+    Ok(response
+        .result
+        .tabs
+        .into_iter()
+        .map(|tab| TabInfo {
+            tab_id: tab.tab_id,
+            workspace_id: tab.workspace_id,
+            label: clean(tab.label),
+            number: tab.number,
+            agent_status: clean(tab.agent_status),
         })
         .collect())
 }
@@ -392,6 +526,16 @@ pub(crate) fn command_output(
 #[derive(Clone)]
 pub struct CliHerdr {
     pub bin: String,
+    /// Arguments inserted before every operation (for named/remote targets).
+    /// Keeping these separate from `bin` avoids shell parsing and injection.
+    pub arg_prefix: Vec<String>,
+    /// Optional daemon socket used for absolute pane.focus. Keeping this
+    /// separate from the CLI is intentional: directional CLI focus is not an
+    /// acceptable substitute for Jump Pane routing.
+    pub socket: Option<String>,
+    /// Only the default local target may infer the default socket. Configured
+    /// targets must provide an explicit socket or are safely unsupported.
+    pub default_socket_allowed: bool,
     cancellation: Option<Arc<AtomicBool>>,
 }
 
@@ -399,6 +543,9 @@ impl CliHerdr {
     pub fn new(bin: String) -> Self {
         CliHerdr {
             bin,
+            arg_prefix: Vec::new(),
+            socket: None,
+            default_socket_allowed: true,
             cancellation: None,
         }
     }
@@ -406,19 +553,117 @@ impl CliHerdr {
     pub fn with_cancellation(&self, cancellation: Arc<AtomicBool>) -> Self {
         CliHerdr {
             bin: self.bin.clone(),
+            arg_prefix: self.arg_prefix.clone(),
+            socket: self.socket.clone(),
+            default_socket_allowed: self.default_socket_allowed,
             cancellation: Some(cancellation),
         }
+    }
+
+    pub fn with_socket(&self, socket: impl Into<String>) -> Self {
+        CliHerdr {
+            bin: self.bin.clone(),
+            arg_prefix: self.arg_prefix.clone(),
+            socket: Some(socket.into()),
+            default_socket_allowed: self.default_socket_allowed,
+            cancellation: self.cancellation.clone(),
+        }
+    }
+
+    pub fn with_arg_prefix(&self, args: Vec<String>) -> Self {
+        CliHerdr {
+            bin: self.bin.clone(),
+            arg_prefix: args,
+            socket: self.socket.clone(),
+            default_socket_allowed: self.default_socket_allowed,
+            cancellation: self.cancellation.clone(),
+        }
+    }
+
+    pub fn without_default_socket(&self) -> Self {
+        CliHerdr {
+            bin: self.bin.clone(),
+            arg_prefix: self.arg_prefix.clone(),
+            socket: self.socket.clone(),
+            default_socket_allowed: false,
+            cancellation: self.cancellation.clone(),
+        }
+    }
+
+    fn socket_path(&self) -> Result<String> {
+        if let Some(socket) = &self.socket {
+            return Ok(socket.clone());
+        }
+        if !self.default_socket_allowed {
+            return Err(HerdrError::Command(
+                "absolute pane focus is unsupported: target has no explicit Unix socket".into(),
+            ));
+        }
+        Ok(std::env::var("HERDR_SOCKET_PATH")
+            .ok()
+            .or_else(|| std::env::var("HERDR_SOCKET").ok())
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_default()
+                    .join(".config/herdr/herdr.sock")
+                    .to_string_lossy()
+                    .into_owned()
+            }))
+    }
+
+    #[cfg(unix)]
+    fn focus_socket(&self, pane_id: &str) -> Result<()> {
+        self.socket_call("pane.focus", serde_json::json!({"pane_id": pane_id}))
+    }
+
+    #[cfg(unix)]
+    fn focus_tab_socket(&self, tab_id: &str) -> Result<()> {
+        self.socket_call("tab.focus", serde_json::json!({"tab_id": tab_id}))
+    }
+
+    /// One absolute-focus socket round trip. `pane.focus` and `tab.focus` share
+    /// the same envelope, so only the method and params differ.
+    #[cfg(unix)]
+    fn socket_call(&self, method: &str, params: serde_json::Value) -> Result<()> {
+        let path = self.socket_path()?;
+        let mut stream = UnixStream::connect(&path)
+            .map_err(|e| HerdrError::Command(format!("connect Herdr socket {path}: {e}")))?;
+        let request = serde_json::json!({
+            "id": format!("muster-{}", std::process::id()),
+            "method": method,
+            "params": params
+        });
+        stream
+            .write_all(format!("{request}\n").as_bytes())
+            .map_err(|e| HerdrError::Command(format!("write {method}: {e}")))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|e| HerdrError::Command(format!("read {method}: {e}")))?;
+        let mut response = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut response)
+            .map_err(|e| HerdrError::Command(format!("read {method}: {e}")))?;
+        let value: serde_json::Value = serde_json::from_str(response.trim())
+            .map_err(|e| HerdrError::InvalidJson(format!("invalid {method} response: {e}")))?;
+        if value.get("error").is_some() {
+            return Err(HerdrError::Command(format!(
+                "{method} failed: {}",
+                sanitize_text(&value["error"].to_string())
+            )));
+        }
+        Ok(())
     }
 
     fn run(&self, args: &[&str]) -> Result<String> {
         let label = format!("herdr {args:?}");
         let mut command = Command::new(&self.bin);
+        command.args(&self.arg_prefix);
         command.args(args);
         let output = command_output(&mut command, &label, self.cancellation.as_deref())?;
         if !output.status.success() {
             return Err(HerdrError::Command(format!(
                 "{label}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                sanitize_text(String::from_utf8_lossy(&output.stderr).trim()).trim()
             )));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -432,6 +677,42 @@ impl Herdr for CliHerdr {
 
     fn list_panes(&self) -> Result<Vec<Pane>> {
         parse_panes(&self.run(&["pane", "list"])?)
+    }
+
+    fn list_tabs(&self) -> Result<Vec<TabInfo>> {
+        parse_tabs(&self.run(&["tab", "list"])?)
+    }
+
+    fn focus_tab(&self, id: &str) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.focus_tab_socket(id)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = id;
+            Err(HerdrError::Command(
+                "absolute tab focus requires a Unix Herdr socket".into(),
+            ))
+        }
+    }
+
+    fn focus_pane(&self, id: &str) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.focus_socket(id)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = id;
+            Err(HerdrError::Command(
+                "absolute pane focus requires a Unix Herdr socket".into(),
+            ))
+        }
+    }
+
+    fn process_name(&self, id: &str) -> Result<Option<String>> {
+        parse_process_name(&self.run(&["pane", "process-info", "--pane", id])?)
     }
 
     fn create_workspace(&self, cwd: &str, label: &str) -> Result<String> {
@@ -502,6 +783,154 @@ mod tests {
     }
 
     #[test]
+    fn parse_tabs_reads_tab_id_workspace_and_label() {
+        let json = r#"{"id":"1","type":"tab_list","result":{"type":"tab_list","tabs":[{"tab_id":"wE:t1","workspace_id":"wE","label":"api","number":2,"agent_status":"working"},{"tab_id":"wB:tA","workspace_id":"wB"}]}}"#;
+        let tabs = parse_tabs(json).unwrap();
+
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].tab_id, "wE:t1");
+        assert_eq!(tabs[0].workspace_id, "wE");
+        assert_eq!(tabs[0].label.as_deref(), Some("api"));
+        assert_eq!(tabs[0].number, Some(2));
+        assert_eq!(tabs[0].agent_status.as_deref(), Some("working"));
+        assert_eq!(tabs[1].tab_id, "wB:tA");
+        assert_eq!(tabs[1].workspace_id, "wB");
+        assert_eq!(tabs[1].label, None);
+        assert_eq!(tabs[1].number, None);
+        assert_eq!(tabs[1].agent_status, None);
+    }
+
+    #[test]
+    fn parse_tabs_rejects_malformed_json_and_missing_tabs() {
+        let cases = [
+            "nope",
+            "{}",
+            r#"{"result":{}}"#,
+            r#"{"result":{"tabs":{}}}"#,
+            r#"{"result":{"tabs":[{"tab_id":7}]}}"#,
+        ];
+
+        for json in cases {
+            let error = parse_tabs(json).unwrap_err();
+            assert!(
+                matches!(&error, HerdrError::InvalidJson(message) if message.contains("invalid tab list JSON")),
+                "{json} => {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_tabs_discards_blank_labels_and_sanitizes_control_characters() {
+        let json = r#"{"result":{"tabs":[{"tab_id":"w1:t1","workspace_id":"w1","label":"   "},{"tab_id":"w1:t2","workspace_id":"w1","label":"\u001b[2J api \u009bK"},{"tab_id":"w1:t3","workspace_id":"w1","label":null}]}}"#;
+        let tabs = parse_tabs(json).unwrap();
+
+        assert_eq!(tabs[0].label, None);
+        assert_eq!(tabs[1].label.as_deref(), Some("[2J api K"));
+        assert_eq!(tabs[2].label, None);
+    }
+
+    #[test]
+    fn parse_tabs_ignores_unknown_tabinfo_fields() {
+        let json = r#"{"result":{"tabs":[{"tab_id":"wE:t1","workspace_id":"wE","label":"api","number":3,"focused":true,"pane_count":2,"agent_status":"working","extra":{"nested":1}}]}}"#;
+        let tabs = parse_tabs(json).unwrap();
+
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].tab_id, "wE:t1");
+        assert_eq!(tabs[0].label.as_deref(), Some("api"));
+    }
+
+    /// A runtime that never overrides `list_tabs`; the default must stay empty
+    /// so tab metadata can never affect pane navigation.
+    struct TablessHerdr;
+
+    impl Herdr for TablessHerdr {
+        fn list_workspaces(&self) -> Result<Vec<Workspace>> {
+            Ok(Vec::new())
+        }
+
+        fn list_panes(&self) -> Result<Vec<Pane>> {
+            Ok(Vec::new())
+        }
+
+        fn create_workspace(&self, _cwd: &str, _label: &str) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn focus_workspace(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn close_workspace(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn close_pane(&self, _id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn list_tabs_default_implementation_returns_empty() {
+        assert!(TablessHerdr.list_tabs().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn focus_pane_uses_absolute_socket_contract() {
+        use std::os::unix::net::UnixListener;
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut stream), &mut request)
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(request.trim()).unwrap();
+            assert_eq!(value["method"], "pane.focus");
+            assert_eq!(value["params"]["pane_id"], "runtime-pane");
+            stream
+                .write_all(b"{\"result\":{\"pane_info\":{\"pane_id\":\"runtime-pane\"}}}\n")
+                .unwrap();
+        });
+        let client = CliHerdr::new("unused".into()).with_socket(socket.to_string_lossy());
+        client.focus_pane("runtime-pane").unwrap();
+        worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn focus_tab_uses_absolute_socket_contract() {
+        use std::os::unix::net::UnixListener;
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut stream), &mut request)
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(request.trim()).unwrap();
+            assert_eq!(value["method"], "tab.focus");
+            assert_eq!(value["params"]["tab_id"], "w1:t2");
+            stream
+                .write_all(b"{\"result\":{\"tab_info\":{\"tab_id\":\"w1:t2\"}}}\n")
+                .unwrap();
+        });
+        let client = CliHerdr::new("unused".into()).with_socket(socket.to_string_lossy());
+        client.focus_tab("w1:t2").unwrap();
+        worker.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_target_without_socket_is_explicitly_unsupported() {
+        let client = CliHerdr::new("unused".into()).without_default_socket();
+        let error = client.focus_pane("pane").unwrap_err().to_string();
+        assert!(error.contains("unsupported") && error.contains("explicit"));
+    }
+
+    #[test]
     fn accepts_null_cwd_and_ignores_blank_names() {
         let json = r#"{"result":{"panes":[{"pane_id":"w1:p1","workspace_id":"w1","cwd":null,"label":"  ","terminal_title_stripped":" title "}]}}"#;
         let panes = parse_panes(json).unwrap();
@@ -530,10 +959,19 @@ mod tests {
         let pane = |suffix: &str| Pane {
             pane_id: format!("w1:p{suffix}"),
             workspace_id: "w1".into(),
+            tab_id: None,
             cwd: None,
+            foreground_cwd: None,
             agent: None,
+            agent_status: None,
             label: None,
+            title: None,
             terminal_title: None,
+            focused: false,
+            hidden: false,
+            plugin: false,
+            floating: false,
+            suppressed: false,
         };
         assert_eq!(pane("1").number(), Some(1));
         assert_eq!(pane("9").number(), Some(9));
