@@ -1,4 +1,4 @@
-use crate::model::{AgentState, Kind, Row};
+use crate::model::{is_related, AgentState, Kind, Row};
 use crate::refresh::{Message as RefreshMessage, ProjectSourceStatus, Snapshot, Updates};
 use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -30,15 +30,28 @@ pub struct Session {
     pub origin_workspace: Option<String>,
 }
 
-// --- Herdr's default Catppuccin Mocha palette ---
-const ACCENT: Color = Color::Rgb(0x89, 0xb4, 0xfa);
+// --- Herdr's default Catppuccin Mocha palette (semantic tokens) ---
+const BASE: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
+const MANTLE: Color = Color::Rgb(0x18, 0x18, 0x25);
+const SURFACE0: Color = Color::Rgb(0x31, 0x32, 0x44);
+const SURFACE1: Color = Color::Rgb(0x45, 0x47, 0x5a);
 const FG: Color = Color::Rgb(0xcd, 0xd6, 0xf4);
+const SUBTEXT0: Color = Color::Rgb(0xa6, 0xad, 0xc8);
 const MUTED: Color = Color::Rgb(0x6c, 0x70, 0x86);
-const FAINT: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
-const SEL_BG: Color = Color::Rgb(0x31, 0x32, 0x44);
-const RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
-const YELLOW: Color = Color::Rgb(0xf9, 0xe2, 0xaf);
+const OVERLAY1: Color = Color::Rgb(0x7f, 0x84, 0x9c);
+const ACCENT: Color = Color::Rgb(0x89, 0xb4, 0xfa);
+const MAUVE: Color = Color::Rgb(0xcb, 0xa6, 0xf7);
+const SAPPHIRE: Color = Color::Rgb(0x74, 0xc7, 0xec);
+const SKY: Color = Color::Rgb(0x89, 0xdc, 0xeb);
+const TEAL: Color = Color::Rgb(0x94, 0xe2, 0xd5);
 const GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
+const PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
+const YELLOW: Color = Color::Rgb(0xf9, 0xe2, 0xaf);
+const RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
+const SEL_BG: Color = SURFACE1;
+const RELATED_BG: Color = SURFACE0;
+const PATH_COLOR: Color = MUTED;
+const FAINT: Color = BASE;
 
 const NAME_W: usize = 20;
 const GLYPH_W: usize = 2;
@@ -235,9 +248,10 @@ fn nth_open_jump(state: &mut PickerState, filtered: &[usize], n: usize) -> Optio
 fn state_color(state: AgentState) -> Color {
     match state {
         AgentState::Blocked => RED,
-        AgentState::Working => YELLOW,
+        AgentState::Working => GREEN,
         AgentState::Done => GREEN,
-        AgentState::Idle | AgentState::Unknown => MUTED,
+        AgentState::Idle => YELLOW,
+        AgentState::Unknown => MUTED,
     }
 }
 
@@ -566,13 +580,16 @@ fn stateful_line(
     state: AgentState,
     agent: Option<&str>,
     name: &str,
+    related: bool,
 ) -> Line<'static> {
     let number_prefix = number.map_or(String::new(), |digit| format!("{digit} "));
     let number_width = display_width(&number_prefix);
     let color = state_color(state);
     let glyph = truncate_to_width(&format!("{} ", state.glyph()), width.min(GLYPH_W));
     let glyph_width = display_width(&glyph);
-    let remaining = width.saturating_sub(number_width + glyph_width);
+    let relation_marker = if related { "↳ " } else { "" };
+    let relation_width = display_width(relation_marker);
+    let remaining = width.saturating_sub(number_width + glyph_width + relation_width);
 
     let full_meta = match agent {
         Some(agent) => format!("{agent} · {}", state.word()),
@@ -590,8 +607,10 @@ fn stateful_line(
         name,
         &secondary_context(row),
         body_budget,
-        Style::default().fg(FG).add_modifier(Modifier::BOLD),
-        Style::default().fg(MUTED),
+        Style::default()
+            .fg(if related { SKY } else { FG })
+            .add_modifier(Modifier::BOLD),
+        Style::default().fg(if related { SAPPHIRE } else { PATH_COLOR }),
     );
     let body_width = spans_width(&body);
     if body_width < body_budget {
@@ -606,6 +625,9 @@ fn stateful_line(
         ));
     }
     spans.push(Span::styled(glyph, Style::default().fg(color)));
+    if related {
+        spans.push(Span::styled(relation_marker, Style::default().fg(SKY)));
+    }
     spans.extend(body);
     if meta_gap > 0 {
         spans.push(Span::raw(" "));
@@ -617,6 +639,15 @@ fn stateful_line(
 }
 
 fn row_line(row: &Row, width: usize, number: Option<usize>) -> Line<'static> {
+    row_line_with_relation(row, width, number, false)
+}
+
+fn row_line_with_relation(
+    row: &Row,
+    width: usize,
+    number: Option<usize>,
+    related: bool,
+) -> Line<'static> {
     if width == 0 {
         return Line::default();
     }
@@ -631,35 +662,59 @@ fn row_line(row: &Row, width: usize, number: Option<usize>) -> Line<'static> {
             row.space
                 .as_ref()
                 .map_or(row.name.as_str(), |space| space.label.as_str()),
+            related,
         ),
         // Tabs and renamed panes are ordinary rows too; they just never carry
         // an Alt+digit number because that numbering is workspace-only.
-        Kind::Tab { state, agent, .. } | Kind::Pane { state, agent, .. } => {
-            stateful_line(row, width, number, *state, agent.as_deref(), &row.name)
-        }
+        Kind::Tab { state, agent, .. } | Kind::Pane { state, agent, .. } => stateful_line(
+            row,
+            width,
+            number,
+            *state,
+            agent.as_deref(),
+            &row.name,
+            related,
+        ),
         Kind::Dormant => {
-            let glyph = " ".repeat(width.min(GLYPH_W));
+            let glyph = truncate_to_width(if related { "↳ " } else { "  " }, width.min(GLYPH_W));
             let body_budget = width.saturating_sub(display_width(&glyph));
-            let mut spans = vec![Span::raw(glyph)];
+            let glyph_style = if related {
+                Style::default().fg(SKY)
+            } else {
+                Style::default()
+            };
+            let mut spans = vec![Span::styled(glyph, glyph_style)];
             spans.extend(body_spans(
                 &row.name,
                 &row.display,
                 body_budget,
-                Style::default().fg(FG),
-                Style::default().fg(FAINT),
+                Style::default().fg(if related { SKY } else { FG }),
+                Style::default().fg(if related { SAPPHIRE } else { PATH_COLOR }),
             ));
             Line::from(truncate_spans(spans, width))
         }
     }
 }
 
+fn header_color(label: &str) -> Color {
+    match label {
+        "OPEN" => MAUVE,
+        "TABS" => PEACH,
+        "PANES" => TEAL,
+        "PROJECTS" => SKY,
+        _ => SUBTEXT0,
+    }
+}
+
 fn header_item(label: &str, suffix: &str, width: usize) -> ListItem<'static> {
     let spans = vec![
         Span::styled(
-            format!("▸ {label} "),
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            format!("── {label} "),
+            Style::default()
+                .fg(header_color(label))
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("— {suffix}"), Style::default().fg(FAINT)),
+        Span::styled(format!("— {suffix}"), Style::default().fg(OVERLAY1)),
     ];
     ListItem::new(Line::from(truncate_spans(spans, width)))
 }
@@ -684,8 +739,8 @@ fn section_spaces(rows: &[Row], filtered: &[usize], group: u8) -> Vec<crate::mod
 fn space_header_item(space: &crate::model::SpaceContext, width: usize) -> ListItem<'static> {
     let mut spans = vec![
         Span::styled(
-            "  ▸ SPACE · ",
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            "  ↳ SPACE · ",
+            Style::default().fg(SAPPHIRE).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             space.label.clone(),
@@ -709,6 +764,7 @@ fn build(
 ) -> (Vec<ListItem<'static>>, usize) {
     let tab_spaces = section_spaces(rows, filtered, 1);
     let pane_spaces = section_spaces(rows, filtered, 2);
+    let active_item = filtered.get(selected).and_then(|index| rows.get(*index));
     let mut items = Vec::new();
     let mut selected_position = 0;
     let mut last_group = None;
@@ -762,7 +818,17 @@ fn build(
         } else {
             None
         };
-        items.push(ListItem::new(row_line(row, width, number)));
+        let related = active_item.is_some_and(|active| is_related(active, row));
+        let item = ListItem::new(if related {
+            row_line_with_relation(row, width, number, true)
+        } else {
+            row_line(row, width, number)
+        });
+        items.push(if related {
+            item.style(Style::default().fg(SKY).bg(RELATED_BG))
+        } else {
+            item
+        });
     }
     (items, selected_position)
 }
@@ -795,9 +861,12 @@ fn keycap(key: &str, label: &str) -> Vec<Span<'static>> {
     vec![
         Span::styled(
             format!(" {key} "),
-            Style::default().fg(Color::Black).bg(MUTED),
+            Style::default()
+                .fg(FG)
+                .bg(SURFACE1)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!(" {label}   "), Style::default().fg(MUTED)),
+        Span::styled(format!(" {label}   "), Style::default().fg(SUBTEXT0)),
     ]
 }
 
@@ -922,10 +991,10 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                 .left_aligned();
                 let mut title_spans = vec![
                     Span::styled(format!(" {open_count} open"), Style::default().fg(GREEN)),
-                    Span::styled(" · ", Style::default().fg(FAINT)),
+                    Span::styled(" · ", Style::default().fg(OVERLAY1)),
                     Span::styled(
                         format!("{project_count} projects"),
-                        Style::default().fg(MUTED),
+                        Style::default().fg(PEACH),
                     ),
                 ];
                 if loading {
@@ -949,7 +1018,8 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(FAINT))
+                    .border_style(Style::default().fg(SURFACE1))
+                    .style(Style::default().bg(MANTLE))
                     .title_top(title_left)
                     .title_top(title_right);
                 let inner = block.inner(area);
@@ -981,7 +1051,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                     ],
                     vec![Span::styled(
                         format!("{} matches", filtered.len()),
-                        Style::default().fg(MUTED),
+                        Style::default().fg(SUBTEXT0),
                     )],
                     width,
                 );
@@ -1013,8 +1083,13 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                     list_state.select(Some(selected_position));
                 }
                 let list = List::new(items)
-                    .highlight_style(Style::default().bg(SEL_BG))
-                    .highlight_symbol("▌ ");
+                    .highlight_style(
+                        Style::default()
+                            .fg(MAUVE)
+                            .bg(SEL_BG)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("▸ ");
                 frame.render_stateful_widget(list, vertical[2], &mut list_state);
 
                 let mut footer = Vec::new();
@@ -1632,6 +1707,24 @@ mod tests {
         let text = row_line(&pane, 120, None).to_string();
         assert!(text.contains("editor"), "{text}");
         assert!(text.contains("w1:p1"), "{text}");
+    }
+
+    #[test]
+    fn selected_workspace_marks_related_rows_across_sections() {
+        let rows = vec![
+            open("w1", "~/work", "/work", &[]),
+            tab_row("api", "w1", "w1:t1", "~/work · w1:t1"),
+            pane_row("editor", "w1", "w1:p1", "~/work · w1:p1"),
+            project("work", "~/work", "/work"),
+            project("other", "~/other", "/other"),
+        ];
+        assert!(is_related(&rows[0], &rows[1]));
+        assert!(is_related(&rows[0], &rows[2]));
+        assert!(is_related(&rows[0], &rows[3]));
+        assert!(!is_related(&rows[0], &rows[4]));
+
+        let linked = row_line_with_relation(&rows[1], 60, None, true).to_string();
+        assert!(linked.contains("↳"), "{linked}");
     }
 
     #[test]

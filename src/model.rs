@@ -120,6 +120,30 @@ impl Row {
     }
 }
 
+/// Whether two rows represent the same workspace/project association.
+/// Live rows use Herdr's stable workspace ID; dormant projects can only be
+/// linked by their path, which is also how project rows are identified.
+pub fn is_related(active_item: &Row, candidate_item: &Row) -> bool {
+    if active_item.id() == candidate_item.id() {
+        return false;
+    }
+
+    fn workspace_id(row: &Row) -> Option<&str> {
+        match &row.kind {
+            Kind::Open { workspace_id, .. }
+            | Kind::Tab { workspace_id, .. }
+            | Kind::Pane { workspace_id, .. } => Some(workspace_id.as_str()),
+            Kind::Dormant => None,
+        }
+    }
+
+    match (workspace_id(active_item), workspace_id(candidate_item)) {
+        (Some(active), Some(candidate)) => active == candidate,
+        (None, None) => active_item.path == candidate_item.path,
+        _ => active_item.path == candidate_item.path,
+    }
+}
+
 /// Canonicalize a workspace cwd for identity/dedup; fall back to the raw path
 /// when it no longer exists on disk.
 fn canon(dir: &str) -> PathBuf {
