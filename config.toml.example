@@ -1,4 +1,4 @@
-# Copy to the dir printed by:  herdr plugin config-dir kichel.muster
+# Copy to the dir printed by:  herdr plugin config-dir tayiorbeii.muster
 # then rename to config.toml
 paths      = ["~/dev/api", "~/notes"]
 roots      = ["~/dev"]

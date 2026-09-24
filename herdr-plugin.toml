@@ -1,4 +1,4 @@
-id = "kichel.muster"
+id = "tayiorbeii.muster"
 name = "Muster"
 version = "0.2.0"
 min_herdr_version = "0.8.0"
@@ -24,10 +24,10 @@ command = ["./target/release/herdr-muster", "--jump-pane"]
 id = "open"
 title = "Muster: pick project"
 contexts = ["workspace"]
-command = ["herdr", "plugin", "pane", "open", "--plugin", "kichel.muster", "--entrypoint", "picker"]
+command = ["herdr", "plugin", "pane", "open", "--plugin", "tayiorbeii.muster", "--entrypoint", "picker"]
 
 [[actions]]
 id = "jump-pane"
 title = "Muster: Jump Pane"
 contexts = ["workspace", "pane"]
-command = ["herdr", "plugin", "pane", "open", "--plugin", "kichel.muster", "--entrypoint", "jump-pane"]
+command = ["herdr", "plugin", "pane", "open", "--plugin", "tayiorbeii.muster", "--entrypoint", "jump-pane"]

@@ -6,6 +6,14 @@ First fork release. Forked from
 [marcoskichel/herdr-muster](https://github.com/marcoskichel/herdr-muster)
 (July 2026); all upstream history is preserved and credited.
 
+### Migration (breaking)
+
+- The plugin ID changed from `kichel.muster` to `tayiorbeii.muster`. After
+  upgrading, move your `config.toml` from the directory printed by
+  `herdr plugin config-dir kichel.muster` to the one printed by
+  `herdr plugin config-dir tayiorbeii.muster`, and update any herdr
+  keybindings that reference `--plugin kichel.muster`.
+
 ### Added
 
 - **Jump Pane mode** — a dedicated existing-pane picker that searches live

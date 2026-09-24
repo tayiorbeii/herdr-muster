@@ -165,7 +165,7 @@ maps to exactly one workspace, remembered from the moment muster creates it.
 | `Alt+letter` | (intentional no-op) | Only Alt+digit is bound |
 
 > Binding outside the switcher (herdr config.toml):
-> `[[keys.command]] key = "prefix+space" type = "shell" command = "herdr plugin pane open --plugin kichel.muster --entrypoint picker"`
+> `[[keys.command]] key = "prefix+space" type = "shell" command = "herdr plugin pane open --plugin tayiorbeii.muster --entrypoint picker"`
 
 ---
 
@@ -177,7 +177,7 @@ roots      = ["~/dev"]                  # scanned 1 level deep for git repos
 use_zoxide = true                       # fold in `zoxide query -l` (default true)
 ```
 
-- Config dir: `herdr plugin config-dir kichel.muster`; missing file ⇒ defaults
+- Config dir: `herdr plugin config-dir tayiorbeii.muster`; missing file ⇒ defaults
   (`paths`/`roots` empty, `use_zoxide = true`); malformed file ⇒ clear error.
 
 ---

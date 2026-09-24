@@ -41,7 +41,7 @@ from source when it sets the plugin up.
 
 ## Configure
 
-    herdr plugin config-dir kichel.muster   # prints the config dir
+    herdr plugin config-dir tayiorbeii.muster   # prints the config dir
 
 Copy `config.toml.example` into that directory as `config.toml` and edit it:
 
@@ -86,7 +86,7 @@ Add this to your herdr `config.toml`, then run `herdr server reload-config`:
     [[keys.command]]
     key = "prefix+space"
     type = "shell"
-    command = "herdr plugin pane open --plugin kichel.muster --entrypoint picker"
+    command = "herdr plugin pane open --plugin tayiorbeii.muster --entrypoint picker"
 
 ## Keys inside the switcher
 
