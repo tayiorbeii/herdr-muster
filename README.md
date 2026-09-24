@@ -21,12 +21,18 @@ the moment it creates the workspace, so it never guesses the project from
 whatever directory a pane happens to be sitting in, and you never end up with
 two workspaces for the same repo.
 
+> **Fork lineage:** this is the actively maintained fork of
+> [marcoskichel/herdr-muster](https://github.com/marcoskichel/herdr-muster)
+> (July 2026). The original history is preserved; new development happens
+> here. A full feature and keymapping reference lives in
+> [docs/FEATURES.md](docs/FEATURES.md).
+
 ## Install
 
 You'll need a Rust toolchain, since `herdr plugin install` compiles the binary
 from source when it sets the plugin up.
 
-    herdr plugin install marcoskichel/herdr-muster
+    herdr plugin install tayiorbeii/herdr-muster
 
 ### Working on it locally
 
