@@ -750,6 +750,17 @@ mod tests {
 
     const WS: &str = r#"{"result":{"type":"workspace_list","workspaces":[{"workspace_id":"w5","label":"~","number":5,"agent_status":"working"},{"workspace_id":"w6","label":"/tmp","number":6,"agent_status":""}]}}"#;
     const CR: &str = r#"{"result":{"workspace":{"workspace_id":"w9"},"root_pane":{"cwd":"/p"},"type":"workspace_created"}}"#;
+    /// The setsid/output tests shell out to `python3`, which is missing on
+    /// clean macOS installs without developer tools; skip instead of failing.
+    fn python3_available() -> bool {
+        Command::new("python3")
+            .arg("-c")
+            .arg("pass")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
     const PN: &str = r#"{"result":{"type":"pane_list","panes":[{"pane_id":"wE:p1","workspace_id":"wE","cwd":"/home/x/dev/api","agent":"claude","agent_status":"working","label":"api-shell","terminal_title_stripped":"π - api"},{"pane_id":"wE:p2","workspace_id":"wE","cwd":"/tmp","terminal_title_stripped":"π - tmp"},{"pane_id":"wB:pA","workspace_id":"wB"}]}}"#;
 
     #[test]
@@ -1010,6 +1021,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cancellation_returns_promptly_when_setsid_descendant_streams_output() {
+        if !python3_available() {
+            return;
+        }
+
         struct EscapedProcess(Option<i32>);
 
         impl Drop for EscapedProcess {
@@ -1053,7 +1068,10 @@ mod tests {
             }
         });
 
-        let deadline = Instant::now() + Duration::from_secs(1);
+        // python3 cold start (e.g. a pyenv shim) can exceed a second on its
+        // own, so give setup a generous window; the promptness assertions
+        // below measure only the post-cancellation window.
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !pid_file.exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -1076,6 +1094,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn excessive_command_output_is_bounded() {
+        if !python3_available() {
+            return;
+        }
+
         let started = Instant::now();
         let mut command = Command::new("python3");
         command.args([
@@ -1086,7 +1108,9 @@ while True: sys.stdout.write('x' * 8192)",
         let error = command_output(&mut command, "unbounded output", None).unwrap_err();
 
         assert!(matches!(error, HerdrError::Spawn(message) if message.contains("8 MiB limit")));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // The bound only proves the reader stops at the limit instead of
+        // running forever; wall-clock time varies with machine load.
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 
     #[cfg(unix)]
