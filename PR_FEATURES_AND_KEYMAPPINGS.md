@@ -153,6 +153,7 @@ maps to exactly one workspace, remembered from the moment muster creates it.
 |---|---|---|
 | any printable char | Fuzzy-filter the list | Works immediately, even while loading; selection resets to top |
 | `↑` / `↓` | Move selection | Clamped at list bounds |
+| `Tab` | Jump to the first result in the next non-empty section | Cycles `OPEN` → `TABS` → `PANES` → `PROJECTS`; skips empty filtered sections and wraps. Moves selection only; it does not activate/focus the target. |
 | `Enter` | **Focus** a live workspace/tab/pane, or **open project** for a dormant directory | Footer label reflects the selected row; project activation may create/bind a workspace |
 | `Alt+0 … Alt+9` | **Quick jump** to the Nth open workspace in the current view | `Alt+1` = most recent, `Alt+0` = tenth (no query); numbers shown on open rows |
 | `Option+0 … Option+9` (macOS glyphs `º¡™£¢∞§¶•ª`) | Same as Alt+digit | For terminals that send the symbol instead of ESC+digit |

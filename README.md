@@ -12,7 +12,9 @@ zoxide suggestions filling out the list. The workspace you were in before
 opening the switcher is ranked last among live workspaces because Escape
 already returns there. Enter focuses a live target or opens a workspace for a
 project directory, and the footer tells you which action applies to the selected
-row.
+row. Press Tab to move the selection to the first result in the next non-empty
+section (OPEN, TABS, PANES, PROJECTS); it skips sections with no filtered matches
+and wraps around without activating the selected result.
 
 Each project maps to exactly one workspace. muster remembers that pairing from
 the moment it creates the workspace, so it never guesses the project from

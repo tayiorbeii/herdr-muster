@@ -164,6 +164,25 @@ impl PickerState {
             .get(self.selected)
             .map(|index| self.rows[*index].clone())
     }
+
+    /// Move to the first actionable row in the next populated section, wrapping
+    /// in OPEN → TABS → PANES → PROJECTS order. Empty sections are skipped.
+    fn next_section(&mut self, filtered: &[usize]) {
+        let Some(current_index) = filtered.get(self.selected) else {
+            return;
+        };
+        let current_section = section(&self.rows[*current_index].kind);
+        for offset in 1..=4 {
+            let target = (current_section + offset) % 4;
+            if let Some(position) = filtered
+                .iter()
+                .position(|index| section(&self.rows[*index].kind) == target)
+            {
+                self.selected = position;
+                return;
+            }
+        }
+    }
 }
 
 /// Map an Alt+digit key to a row index, where 1 is the most recently used
@@ -1002,6 +1021,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                 if let Some(row) = state.selected_row(&filtered) {
                     footer.extend(keycap("↵", enter_action(&row.kind)));
                 }
+                footer.extend(keycap("tab", "next section"));
                 footer.extend(keycap("⌥0-9", "recents"));
                 footer.extend(keycap("^n", "force new"));
                 footer.extend(keycap("^x", "close"));
@@ -1067,6 +1087,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                         state.selected += 1;
                     }
                 }
+                KeyCode::Tab => state.next_section(&filtered),
                 KeyCode::Backspace => {
                     state.query.pop();
                     state.selected = 0;
@@ -1536,6 +1557,67 @@ mod tests {
         assert_eq!(filter(&rows, "w1:t2", &mut matcher), vec![1]);
         assert_eq!(filter(&rows, "w1:p1", &mut matcher), vec![2]);
         assert_eq!(filter(&rows, "dormant", &mut matcher), vec![3]);
+    }
+
+    #[test]
+    fn tab_cycles_to_first_row_of_each_populated_section_and_wraps() {
+        let rows = vec![
+            open("workspace", "common", "/Users/me/work", &[]),
+            tab_row("first tab", "w1", "w1:t1", "common"),
+            tab_row("second tab", "w1", "w1:t2", "common"),
+            pane_row("editor", "w1", "w1:p1", "common"),
+            project("project", "common", "/Users/me/project"),
+        ];
+        let mut state = PickerState {
+            rows,
+            query: String::new(),
+            selected: 2,
+        };
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+        let filtered = state.filtered(&mut matcher);
+
+        // From within TABS, jump to the first actionable PANES row.
+        state.next_section(&filtered);
+        assert_eq!(state.selected, 3);
+        // Continue in section order, then wrap to OPEN and TABS.
+        state.next_section(&filtered);
+        assert_eq!(state.selected, 4);
+        state.next_section(&filtered);
+        assert_eq!(state.selected, 0);
+        state.next_section(&filtered);
+        assert_eq!(state.selected, 1);
+    }
+
+    #[test]
+    fn tab_skips_sections_removed_by_filtering_and_stays_put_if_alone() {
+        let rows = vec![
+            open("workspace", "common", "/Users/me/work", &[]),
+            tab_row("api", "w1", "w1:t1", "unmatched"),
+            pane_row("editor", "w1", "w1:p1", "unmatched"),
+            project("project", "common", "/Users/me/project"),
+        ];
+        let mut state = PickerState {
+            rows,
+            query: "common".into(),
+            selected: 0,
+        };
+        let mut matcher = Matcher::new(NucleoConfig::DEFAULT);
+        let filtered = state.filtered(&mut matcher);
+        assert_eq!(filtered, vec![0, 3]);
+
+        // TABS and PANES are empty in this filtered view, so jump directly to
+        // PROJECTS rather than a section header or a non-matching row.
+        state.next_section(&filtered);
+        assert_eq!(state.selected, 1);
+        state.next_section(&filtered);
+        assert_eq!(state.selected, 0);
+
+        state.query = "editor".into();
+        state.selected = 0;
+        let filtered = state.filtered(&mut matcher);
+        assert_eq!(filtered, vec![2]);
+        state.next_section(&filtered);
+        assert_eq!(state.selected, 0);
     }
 
     #[test]
