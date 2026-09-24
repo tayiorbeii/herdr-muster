@@ -609,13 +609,20 @@ fn stateful_line(
     agent: Option<&str>,
     name: &str,
     related: bool,
+    pinned: bool,
 ) -> Line<'static> {
     let number_prefix = number.map_or(String::new(), |digit| format!("{digit} "));
     let number_width = display_width(&number_prefix);
     let color = state_color(state);
     let glyph = truncate_to_width(&format!("{} ", state.glyph()), width.min(GLYPH_W));
     let glyph_width = display_width(&glyph);
-    let relation_marker = if related { "↳ " } else { "" };
+    let relation_marker = if pinned {
+        "● "
+    } else if related {
+        "↳ "
+    } else {
+        ""
+    };
     let relation_width = display_width(relation_marker);
     let remaining = width.saturating_sub(number_width + glyph_width + relation_width);
 
@@ -636,7 +643,13 @@ fn stateful_line(
         &secondary_context(row),
         body_budget,
         Style::default()
-            .fg(if related { SKY } else { FG })
+            .fg(if pinned {
+                MAUVE
+            } else if related {
+                SKY
+            } else {
+                FG
+            })
             .add_modifier(Modifier::BOLD),
         Style::default().fg(if related { SAPPHIRE } else { PATH_COLOR }),
     );
@@ -653,8 +666,11 @@ fn stateful_line(
         ));
     }
     spans.push(Span::styled(glyph, Style::default().fg(color)));
-    if related {
-        spans.push(Span::styled(relation_marker, Style::default().fg(SKY)));
+    if pinned || related {
+        spans.push(Span::styled(
+            relation_marker,
+            Style::default().fg(if pinned { MAUVE } else { SKY }),
+        ));
     }
     spans.extend(body);
     if meta_gap > 0 {
@@ -679,7 +695,7 @@ fn stateful_line(
 }
 
 fn row_line(row: &Row, width: usize, number: Option<usize>) -> Line<'static> {
-    row_line_with_relation(row, width, number, false)
+    row_line_with_relation(row, width, number, false, false)
 }
 
 fn row_line_with_relation(
@@ -687,6 +703,7 @@ fn row_line_with_relation(
     width: usize,
     number: Option<usize>,
     related: bool,
+    pinned: bool,
 ) -> Line<'static> {
     if width == 0 {
         return Line::default();
@@ -703,6 +720,7 @@ fn row_line_with_relation(
                 .as_ref()
                 .map_or(row.name.as_str(), |space| space.label.as_str()),
             related,
+            pinned,
         ),
         // Tabs and renamed panes are ordinary rows too; they just never carry
         // an Alt+digit number because that numbering is workspace-only.
@@ -714,11 +732,21 @@ fn row_line_with_relation(
             agent.as_deref(),
             &row.name,
             related,
+            pinned,
         ),
         Kind::Dormant => {
-            let glyph = truncate_to_width(if related { "↳ " } else { "  " }, width.min(GLYPH_W));
+            let marker = if pinned {
+                "● "
+            } else if related {
+                "↳ "
+            } else {
+                "  "
+            };
+            let glyph = truncate_to_width(marker, width.min(GLYPH_W));
             let body_budget = width.saturating_sub(display_width(&glyph));
-            let glyph_style = if related {
+            let glyph_style = if pinned {
+                Style::default().fg(MAUVE)
+            } else if related {
                 Style::default().fg(SKY)
             } else {
                 Style::default()
@@ -802,9 +830,21 @@ fn build(
     selected: usize,
     width: usize,
 ) -> (Vec<ListItem<'static>>, usize) {
+    build_with_anchor(rows, filtered, selected, width, None)
+}
+
+fn build_with_anchor(
+    rows: &[Row],
+    filtered: &[usize],
+    selected: usize,
+    width: usize,
+    anchor: Option<&crate::model::RowId>,
+) -> (Vec<ListItem<'static>>, usize) {
     let tab_spaces = section_spaces(rows, filtered, 1);
     let pane_spaces = section_spaces(rows, filtered, 2);
-    let active_item = filtered.get(selected).and_then(|index| rows.get(*index));
+    let active_item = anchor
+        .and_then(|id| rows.iter().find(|row| row.id() == *id))
+        .or_else(|| filtered.get(selected).and_then(|index| rows.get(*index)));
     let mut items = Vec::new();
     let mut selected_position = 0;
     let mut last_group = None;
@@ -858,13 +898,12 @@ fn build(
         } else {
             None
         };
-        let related = active_item.is_some_and(|active| is_related(active, row));
-        let item = ListItem::new(if related {
-            row_line_with_relation(row, width, number, true)
-        } else {
-            row_line(row, width, number)
-        });
-        items.push(if related {
+        let pinned = anchor.is_some_and(|id| row.id() == *id);
+        let related = !pinned && active_item.is_some_and(|active| is_related(active, row));
+        let item = ListItem::new(row_line_with_relation(row, width, number, related, pinned));
+        items.push(if pinned {
+            item.style(Style::default().fg(MAUVE).bg(RELATED_BG))
+        } else if related {
             item.style(Style::default().fg(SKY).bg(RELATED_BG))
         } else {
             item
@@ -967,6 +1006,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
     let mut live_workspace_ids = None;
     let mut origin_workspace = None;
     let mut channel_open = true;
+    let mut highlight_anchor: Option<crate::model::RowId> = None;
     let mut outcome = Outcome::Cancel;
 
     let result = (|| -> io::Result<Session> {
@@ -1008,6 +1048,12 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
             }
 
             let filtered = state.filtered(&mut matcher);
+            if highlight_anchor
+                .as_ref()
+                .is_some_and(|anchor| !state.rows.iter().any(|row| row.id() == *anchor))
+            {
+                highlight_anchor = None;
+            }
             if state.selected >= filtered.len() {
                 state.selected = filtered.len().saturating_sub(1);
             }
@@ -1116,7 +1162,13 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                         0,
                     )
                 } else {
-                    build(&state.rows, &filtered, state.selected, list_width)
+                    build_with_anchor(
+                        &state.rows,
+                        &filtered,
+                        state.selected,
+                        list_width,
+                        highlight_anchor.as_ref(),
+                    )
                 };
                 let mut list_state = ListState::default();
                 if !filtered.is_empty() {
@@ -1196,14 +1248,27 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                         }
                     }
                 }
-                KeyCode::Up => state.selected = state.selected.saturating_sub(1),
+                KeyCode::Up => {
+                    let next = state.selected.saturating_sub(1);
+                    if next != state.selected {
+                        highlight_anchor = None;
+                        state.selected = next;
+                    }
+                }
                 KeyCode::Down => {
                     if state.selected + 1 < filtered.len() {
+                        highlight_anchor = None;
                         state.selected += 1;
                     }
                 }
-                KeyCode::Tab => state.next_section(&filtered),
+                KeyCode::Tab => {
+                    if highlight_anchor.is_none() {
+                        highlight_anchor = state.selected_row(&filtered).map(|row| row.id());
+                    }
+                    state.next_section(&filtered);
+                }
                 KeyCode::Backspace => {
+                    highlight_anchor = None;
                     state.query.pop();
                     state.selected = 0;
                 }
@@ -1216,6 +1281,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                             break;
                         }
                     }
+                    highlight_anchor = None;
                     state.query.push(character);
                     state.selected = 0;
                 }
@@ -1763,8 +1829,16 @@ mod tests {
         assert!(is_related(&rows[0], &rows[3]));
         assert!(!is_related(&rows[0], &rows[4]));
 
-        let linked = row_line_with_relation(&rows[1], 60, None, true).to_string();
+        let linked = row_line_with_relation(&rows[1], 60, None, true, false).to_string();
         assert!(linked.contains("↳"), "{linked}");
+
+        let anchor_id = rows[0].id();
+        let filtered: Vec<usize> = (0..rows.len()).collect();
+        let (items, selected_position) =
+            build_with_anchor(&rows, &filtered, 1, 60, Some(&anchor_id));
+        assert_eq!(selected_position, 3);
+        assert!(format!("{:?}", items[1]).contains("●"));
+        assert!(format!("{:?}", items[3]).contains("↳"));
     }
 
     #[test]
