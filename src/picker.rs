@@ -545,6 +545,30 @@ fn secondary_context(row: &Row) -> String {
     }
 }
 
+fn context_spans(text: &str, style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let next_label = ["panes:", "tabs:", "folder:"]
+            .iter()
+            .filter_map(|label| rest.find(label).map(|index| (index, *label)))
+            .min_by_key(|(index, _)| *index);
+        let Some((index, label)) = next_label else {
+            spans.push(Span::styled(rest.to_string(), style));
+            break;
+        };
+        if index > 0 {
+            spans.push(Span::styled(rest[..index].to_string(), style));
+        }
+        spans.push(Span::styled(
+            label.to_string(),
+            Style::default().fg(OVERLAY1),
+        ));
+        rest = &rest[index + label.len()..];
+    }
+    spans
+}
+
 fn body_spans(
     name: &str,
     path: &str,
@@ -561,11 +585,15 @@ fn body_spans(
 
     let name_budget = NAME_W.min(budget.saturating_sub(5));
     let path_budget = budget.saturating_sub(name_budget + 1);
-    vec![
+    let mut spans = vec![
         Span::styled(pad_to_width(name, name_budget), name_style),
         Span::raw(" "),
-        Span::styled(truncate_to_width(path, path_budget), path_style),
-    ]
+    ];
+    spans.extend(context_spans(
+        &truncate_to_width(path, path_budget),
+        path_style,
+    ));
+    spans
 }
 
 /// One row constrained to `width` terminal display columns. `number` is the
@@ -621,7 +649,7 @@ fn stateful_line(
     if !number_prefix.is_empty() {
         spans.push(Span::styled(
             number_prefix,
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+            Style::default().fg(SUBTEXT0).add_modifier(Modifier::BOLD),
         ));
     }
     spans.push(Span::styled(glyph, Style::default().fg(color)));
@@ -633,7 +661,19 @@ fn stateful_line(
         spans.push(Span::raw(" "));
     }
     if !meta.is_empty() {
-        spans.push(Span::styled(meta, Style::default().fg(color)));
+        if let Some((agent_tag, status)) = meta.split_once(" · ") {
+            spans.push(Span::styled(
+                agent_tag.to_string(),
+                Style::default().fg(MAUVE),
+            ));
+            spans.push(Span::styled(" · ", Style::default().fg(OVERLAY1)));
+            spans.push(Span::styled(status.to_string(), Style::default().fg(color)));
+        } else {
+            spans.push(Span::styled(
+                meta,
+                Style::default().fg(if agent.is_some() { MAUVE } else { color }),
+            ));
+        }
     }
     Line::from(truncate_spans(spans, width))
 }
