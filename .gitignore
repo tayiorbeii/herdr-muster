@@ -1,1 +1,5 @@
 /target
+.DS_Store
+.pi-persona/
+.pi-subagents/
+plans/
