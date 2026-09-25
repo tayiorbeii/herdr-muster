@@ -1,7 +1,10 @@
 use crate::model::{is_related, AgentState, Kind, Row};
 use crate::refresh::{Message as RefreshMessage, ProjectSourceStatus, Snapshot, Updates};
 use crossterm::cursor;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEventKind,
+};
 use crossterm::{execute, terminal};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as NucleoConfig, Matcher, Utf32Str};
@@ -61,6 +64,7 @@ const EVENT_POLL: Duration = Duration::from_millis(50);
 struct TerminalGuard {
     raw_mode: bool,
     alternate_screen: bool,
+    mouse_capture: bool,
 }
 
 impl TerminalGuard {
@@ -68,6 +72,7 @@ impl TerminalGuard {
         let mut guard = TerminalGuard {
             raw_mode: false,
             alternate_screen: false,
+            mouse_capture: false,
         };
         terminal::enable_raw_mode()?;
         guard.raw_mode = true;
@@ -76,6 +81,11 @@ impl TerminalGuard {
             return Err(error);
         }
         guard.alternate_screen = true;
+        guard.mouse_capture = true;
+        if let Err(error) = execute!(stdout(), EnableMouseCapture) {
+            let _ = guard.restore();
+            return Err(error);
+        }
         if let Err(error) = execute!(stdout(), cursor::Hide) {
             let _ = guard.restore();
             return Err(error);
@@ -85,13 +95,23 @@ impl TerminalGuard {
 
     fn restore(&mut self) -> io::Result<()> {
         let mut failure = None;
+        if self.mouse_capture {
+            if let Err(error) = execute!(stdout(), DisableMouseCapture) {
+                failure = Some(error);
+            }
+            self.mouse_capture = false;
+        }
         if self.alternate_screen {
             if let Err(error) = execute!(stdout(), cursor::Show, terminal::LeaveAlternateScreen) {
-                failure = Some(error);
+                if failure.is_none() {
+                    failure = Some(error);
+                }
             }
             self.alternate_screen = false;
         } else if let Err(error) = execute!(stdout(), cursor::Show) {
-            failure = Some(error);
+            if failure.is_none() {
+                failure = Some(error);
+            }
         }
         if self.raw_mode {
             if let Err(error) = terminal::disable_raw_mode() {
@@ -829,7 +849,7 @@ fn build(
     filtered: &[usize],
     selected: usize,
     width: usize,
-) -> (Vec<ListItem<'static>>, usize) {
+) -> (Vec<ListItem<'static>>, usize, Vec<Option<usize>>) {
     build_with_anchor(rows, filtered, selected, width, None)
 }
 
@@ -839,13 +859,14 @@ fn build_with_anchor(
     selected: usize,
     width: usize,
     anchor: Option<&crate::model::RowId>,
-) -> (Vec<ListItem<'static>>, usize) {
+) -> (Vec<ListItem<'static>>, usize, Vec<Option<usize>>) {
     let tab_spaces = section_spaces(rows, filtered, 1);
     let pane_spaces = section_spaces(rows, filtered, 2);
     let active_item = anchor
         .and_then(|id| rows.iter().find(|row| row.id() == *id))
         .or_else(|| filtered.get(selected).and_then(|index| rows.get(*index)));
     let mut items = Vec::new();
+    let mut row_positions = Vec::new();
     let mut selected_position = 0;
     let mut last_group = None;
     let mut last_space: Option<(String, Option<String>)> = None;
@@ -875,6 +896,7 @@ fn build_with_anchor(
                 default_suffix.to_string()
             };
             items.push(header_item(label, &suffix, width));
+            row_positions.push(None);
             last_group = Some(group);
             last_space = None;
         }
@@ -883,6 +905,7 @@ fn build_with_anchor(
                 let key = (space.label.clone(), space.disambiguator.clone());
                 if last_space.as_ref() != Some(&key) {
                     items.push(space_header_item(space, width));
+                    row_positions.push(None);
                     last_space = Some(key);
                 }
             }
@@ -908,8 +931,9 @@ fn build_with_anchor(
         } else {
             item
         });
+        row_positions.push(Some(filtered_index));
     }
-    (items, selected_position)
+    (items, selected_position, row_positions)
 }
 
 fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
@@ -927,6 +951,38 @@ fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> 
     ));
     left.extend(right);
     Line::from(truncate_spans(left, width))
+}
+
+fn mouse_in_area(column: u16, row: u16, area: Rect) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
+fn mouse_row_index(
+    column: u16,
+    row: u16,
+    area: Rect,
+    list_offset: usize,
+    row_positions: &[Option<usize>],
+) -> Option<usize> {
+    if !mouse_in_area(column, row, area) {
+        return None;
+    }
+    let relative_row = row - area.y;
+    row_positions
+        .get(list_offset + usize::from(relative_row))
+        .copied()
+        .flatten()
+}
+
+fn mouse_scroll_target(selected: usize, count: usize, kind: MouseEventKind) -> Option<usize> {
+    match kind {
+        MouseEventKind::ScrollUp if selected > 0 => Some(selected - 1),
+        MouseEventKind::ScrollDown if selected.saturating_add(1) < count => Some(selected + 1),
+        _ => None,
+    }
 }
 
 fn enter_action(kind: &Kind) -> &'static str {
@@ -1068,6 +1124,9 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                 .filter(|row| matches!(row.kind, Kind::Dormant))
                 .count();
 
+            let mut list_state = ListState::default();
+            let mut list_area = Rect::default();
+            let mut row_positions = Vec::new();
             terminal.draw(|frame| {
                 let area = frame.area();
                 let title_left = Line::from(vec![Span::styled(
@@ -1149,7 +1208,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                 frame.render_widget(Paragraph::new(rule).style(rule_style), vertical[3]);
 
                 let list_width = width.saturating_sub(HL_W);
-                let (items, selected_position) = if filtered.is_empty() {
+                let (items, selected_position, rendered_row_positions) = if filtered.is_empty() {
                     (
                         vec![empty_item(
                             loading,
@@ -1160,6 +1219,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                             list_width,
                         )],
                         0,
+                        vec![None],
                     )
                 } else {
                     build_with_anchor(
@@ -1170,7 +1230,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                         highlight_anchor.as_ref(),
                     )
                 };
-                let mut list_state = ListState::default();
+                row_positions = rendered_row_positions;
                 if !filtered.is_empty() {
                     list_state.select(Some(selected_position));
                 }
@@ -1182,7 +1242,8 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                             .add_modifier(Modifier::BOLD),
                     )
                     .highlight_symbol("▸ ");
-                frame.render_stateful_widget(list, vertical[2], &mut list_state);
+                list_area = vertical[2];
+                frame.render_stateful_widget(list, list_area, &mut list_state);
 
                 let mut footer = Vec::new();
                 if let Some(row) = state.selected_row(&filtered) {
@@ -1198,12 +1259,42 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                     vertical[4],
                 );
             })?;
+            let list_offset = list_state.offset();
 
             if !event::poll(EVENT_POLL)? {
                 continue;
             }
-            let Event::Key(key) = event::read()? else {
-                continue;
+            let key = match event::read()? {
+                Event::Key(key) => key,
+                Event::Mouse(mouse) => {
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Some(index) = mouse_row_index(
+                                mouse.column,
+                                mouse.row,
+                                list_area,
+                                list_offset,
+                                &row_positions,
+                            ) {
+                                highlight_anchor = None;
+                                state.selected = index;
+                            }
+                        }
+                        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                            if mouse_in_area(mouse.column, mouse.row, list_area) =>
+                        {
+                            if let Some(index) =
+                                mouse_scroll_target(state.selected, filtered.len(), mouse.kind)
+                            {
+                                highlight_anchor = None;
+                                state.selected = index;
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                _ => continue,
             };
             if key.kind != KeyEventKind::Press {
                 continue;
@@ -1710,7 +1801,7 @@ mod tests {
 
         assert_eq!(filter(&rows, "newsletter", &mut matcher), vec![1, 2]);
         let filtered = vec![0, 1, 2, 3];
-        let (items, selected_position) = build(&rows, &filtered, 3, 100);
+        let (items, selected_position, _) = build(&rows, &filtered, 3, 100);
         let debug: Vec<String> = items.iter().map(|item| format!("{item:?}")).collect();
         assert!(debug
             .iter()
@@ -1834,7 +1925,7 @@ mod tests {
 
         let anchor_id = rows[0].id();
         let filtered: Vec<usize> = (0..rows.len()).collect();
-        let (items, selected_position) =
+        let (items, selected_position, _) =
             build_with_anchor(&rows, &filtered, 1, 60, Some(&anchor_id));
         assert_eq!(selected_position, 3);
         assert!(format!("{:?}", items[1]).contains("●"));
@@ -1850,16 +1941,46 @@ mod tests {
             project("dormant", "~/dormant", "/Users/me/dormant"),
         ];
         let filtered: Vec<usize> = (0..rows.len()).collect();
-        let (items, selected_position) = build(&rows, &filtered, 0, 100);
+        let (items, selected_position, row_positions) = build(&rows, &filtered, 0, 100);
 
         // Four sections, so four headers plus one item per row.
         assert_eq!(items.len(), rows.len() + 4);
         assert_eq!(selected_position, 1);
+        assert_eq!(
+            row_positions,
+            vec![None, Some(0), None, Some(1), None, Some(2), None, Some(3)]
+        );
         let debug: Vec<String> = items.iter().map(|item| format!("{item:?}")).collect();
         assert!(debug[0].contains("OPEN"), "{}", debug[0]);
         assert!(debug[2].contains("TABS"), "{}", debug[2]);
         assert!(debug[4].contains("PANES"), "{}", debug[4]);
         assert!(debug[6].contains("PROJECTS"), "{}", debug[6]);
+    }
+
+    #[test]
+    fn mouse_click_maps_visible_list_rows_and_ignores_headers_and_bounds() {
+        let area = Rect::new(10, 5, 20, 3);
+        let row_positions = [None, Some(0), None, Some(1), Some(2)];
+
+        assert_eq!(mouse_row_index(10, 5, area, 1, &row_positions), Some(0));
+        assert_eq!(mouse_row_index(10, 6, area, 1, &row_positions), None);
+        assert_eq!(mouse_row_index(10, 7, area, 1, &row_positions), Some(1));
+        assert_eq!(mouse_row_index(30, 5, area, 1, &row_positions), None);
+        assert_eq!(mouse_row_index(10, 8, area, 1, &row_positions), None);
+        assert!(!mouse_in_area(30, 5, area));
+        assert!(!mouse_in_area(10, 8, area));
+    }
+
+    #[test]
+    fn mouse_scroll_moves_selection_within_filtered_rows() {
+        assert_eq!(mouse_scroll_target(1, 3, MouseEventKind::ScrollUp), Some(0));
+        assert_eq!(
+            mouse_scroll_target(1, 3, MouseEventKind::ScrollDown),
+            Some(2)
+        );
+        assert_eq!(mouse_scroll_target(0, 3, MouseEventKind::ScrollUp), None);
+        assert_eq!(mouse_scroll_target(2, 3, MouseEventKind::ScrollDown), None);
+        assert_eq!(mouse_scroll_target(0, 0, MouseEventKind::ScrollDown), None);
     }
 
     #[test]
