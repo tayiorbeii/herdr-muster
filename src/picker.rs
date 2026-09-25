@@ -953,6 +953,13 @@ fn spread(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> 
     Line::from(truncate_spans(left, width))
 }
 
+fn is_left_click(kind: MouseEventKind) -> bool {
+    matches!(
+        kind,
+        MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+    )
+}
+
 fn mouse_in_area(column: u16, row: u16, area: Rect) -> bool {
     column >= area.x
         && column < area.x.saturating_add(area.width)
@@ -1268,7 +1275,7 @@ pub fn run(mut state: PickerState, updates: Updates) -> io::Result<Session> {
                 Event::Key(key) => key,
                 Event::Mouse(mouse) => {
                     match mouse.kind {
-                        MouseEventKind::Down(MouseButton::Left) => {
+                        kind if is_left_click(kind) => {
                             if let Some(index) = mouse_row_index(
                                 mouse.column,
                                 mouse.row,
@@ -1959,6 +1966,10 @@ mod tests {
 
     #[test]
     fn mouse_click_maps_visible_list_rows_and_ignores_headers_and_bounds() {
+        assert!(is_left_click(MouseEventKind::Down(MouseButton::Left)));
+        assert!(is_left_click(MouseEventKind::Up(MouseButton::Left)));
+        assert!(!is_left_click(MouseEventKind::Down(MouseButton::Right)));
+
         let area = Rect::new(10, 5, 20, 3);
         let row_positions = [None, Some(0), None, Some(1), Some(2)];
 
